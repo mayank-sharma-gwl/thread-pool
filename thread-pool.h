@@ -67,6 +67,12 @@ public:
         return resultFuture;
     }
 
+    /// Submit a task that operates on a shared object with internal synchronization.
+    /// @tparam T        Type of the shared object
+    /// @tparam Callable A callable taking (T&), e.g. a lambda
+    template <typename T, typename Callable>
+    void executeOnShared(T& sharedObject, Callable&& task);
+
     // Pause the pool: running tasks finish, new tasks will not start until resumed.
     void pause();
     // Resume a paused pool, allowing workers to continue processing tasks.
