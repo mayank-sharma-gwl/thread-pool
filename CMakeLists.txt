@@ -80,8 +80,9 @@ find_package(Threads REQUIRED)
 set(CMAKE_C_COMPILER /usr/bin/clang)
 set(CMAKE_CXX_COMPILER /usr/bin/clang++)
 
-# Enable testing
+# Enable testing and include GoogleTest module
 include(CTest)
+include(GoogleTest)
 enable_testing()
 
 # Find GTest package with forced paths
@@ -112,3 +113,13 @@ target_link_libraries(thread_pool_test
 
 # Register test
 add_test(NAME thread_pool_tests COMMAND thread_pool_test)
+
+# Enable test discovery
+set_target_properties(thread_pool_test PROPERTIES
+    GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST
+)
+
+gtest_discover_tests(thread_pool_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
