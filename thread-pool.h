@@ -174,12 +174,15 @@ public:
     // The parallelFor declaration
     template<typename IndexType, typename Func>
     void parallelFor(IndexType start,
-                                 IndexType end,
-                                 Func&&    func,
-                                 size_t    chunkSize = 1) // Added default chunkSize
+                     IndexType end,
+                     Func&& func,
+                     size_t chunkSize = 0) // Use 0 to auto-compute the chunk size
     {
-        if (start >= end || chunkSize == 0)
+        if (start >= end)
             return;
+        
+        if (chunkSize == 0)
+            chunkSize = (end - start + getThreadCount() - 1) / getThreadCount();
 
         std::vector<std::future<void>> futures;
         futures.reserve((end - start + chunkSize - 1) / chunkSize);
@@ -204,7 +207,6 @@ public:
                 future.get();
             } catch (...) {
                 if (!exception) {
-                    // Store first exception, allow others to be discarded
                     exception = std::current_exception();
                 }
             }
