@@ -1,65 +1,68 @@
+// thread_pool.cpp — standalone implementation matching thread-pool.h
+// ------------------------------------------------------------------
 #include "thread-pool.h"
+#include <iostream>
 
 thread_local bool ThreadPool::isWorkerThread_ = false;
 
-
-ThreadPool::ThreadPool(size_t threadCount, bool complete_on_destruction)
-    : threadCount_(threadCount),
-      completeOnDestruction_(complete_on_destruction)
+//--------------------------------------------------------------------
+// Constructor
+//--------------------------------------------------------------------
+ThreadPool::ThreadPool(std::size_t threadCount, bool completeOnDestruction)
+    : syncMode_(threadCount == 0),
+      threadCount_(threadCount ? threadCount : 1),
+      completeOnDestruction_(completeOnDestruction),
+      taskQueues_(threadCount_),
+      queueMutexes_(threadCount_)
 {
-    // Only create worker threads and task queues if threadCount_ > 0.
+    // If threadCount_ is zero, pool works synchronously (enqueue executes inline)
     if (threadCount_ > 0)
     {
-        // Initialize task queues and corresponding mutexes
-        taskQueues_.reset(new std::deque<std::unique_ptr<ITask>>[threadCount_]);
-        queueMutexes_.reset(new std::mutex[threadCount_]);
-        // Launch worker threads
         threads_.reserve(threadCount_);
-        for (size_t i = 0; i < threadCount_; ++i)
-        {
+        for (std::size_t i = 0; i < threadCount_; ++i)
             threads_.emplace_back(&ThreadPool::workerThread, this, i);
-        }
     }
 }
 
+//--------------------------------------------------------------------
+// Destructor
+//--------------------------------------------------------------------
 ThreadPool::~ThreadPool()
 {
     shutdown();
 }
 
+//--------------------------------------------------------------------
+// Pause / Resume
+//--------------------------------------------------------------------
 void ThreadPool::pause()
 {
-    std::unique_lock<std::mutex> lock(masterMutex_);
     paused_.store(true, std::memory_order_relaxed);
-    // No need to notify here; workers will check `paused_` in their wait predicate
 }
 
 void ThreadPool::resume()
 {
-    {
-        std::unique_lock<std::mutex> lock(masterMutex_);
-        if (!paused_.load(std::memory_order_relaxed))
-        {
-            return; // already running
-        }
-        paused_.store(false, std::memory_order_relaxed);
-    }
-    // Wake all workers so they re-evaluate the pause condition
+    if (!paused_.exchange(false, std::memory_order_relaxed))
+        return;
     tasksCV_.notify_all();
 }
 
+//--------------------------------------------------------------------
+// waitForCompletion (external threads only)
+//--------------------------------------------------------------------
 void ThreadPool::waitForCompletion()
 {
-    if (is_worker_thread())
-    {
-        throw std::logic_error("waitForCompletion() called from worker thread");
-    }
-    std::unique_lock<std::mutex> lock(finishedMutex_);
-    finishedCV_.wait(lock, [this]()
+    if (isWorkerThread_)
+        throw std::logic_error("ThreadPool::waitForCompletion() cannot be called from worker thread");
+
+    std::unique_lock<std::mutex> lk(masterMutex_);
+    finishedCV_.wait(lk, [this]
                      { return tasksCount_.load(std::memory_order_acquire) == 0; });
-    // Returns when no tasks are pending or running
 }
 
+//--------------------------------------------------------------------
+// shutdown (non‑blocking, can be called multiple times)
+//--------------------------------------------------------------------
 void ThreadPool::shutdown()
 {
     // Stop accepting new tasks
@@ -101,54 +104,50 @@ void ThreadPool::shutdown()
     }
 }
 
-void ThreadPool::workerThread(size_t index)
+//--------------------------------------------------------------------
+// workerThread — work‑stealing loop
+//--------------------------------------------------------------------
+void ThreadPool::workerThread(std::size_t idx)
 {
-    // Store thread ID in the vector at the index position
-    // workerThreadIds_[index] = std::this_thread::get_id();
-
     isWorkerThread_ = true;
-    for (;;)
+    while (true)
     {
-        // Wait for a task to be available or for shutdown/pause signals
-        std::unique_lock<std::mutex> lock(masterMutex_);
-        tasksCV_.wait(lock, [this]()
-                      { return stopFlag_.load(std::memory_order_relaxed) ||
-                               (!paused_.load(std::memory_order_relaxed) &&
-                                tasksCount_.load(std::memory_order_relaxed) > 0); });
-        if (stopFlag_.load(std::memory_order_relaxed))
+        // Wait for work or exit signal
         {
-            // Shutdown signal received
-            return;
+            std::unique_lock<std::mutex> lk(masterMutex_);
+            tasksCV_.wait(lk, [this]
+                          { return stopFlag_.load(std::memory_order_relaxed) ||
+                                   (!paused_.load(std::memory_order_relaxed) &&
+                                    tasksCount_.load(std::memory_order_relaxed) > 0); });
+            if (stopFlag_.load(std::memory_order_relaxed))
+                return;
         }
-        lock.unlock(); // release master lock before accessing task queues
 
-        // Fetch a task if available
         std::unique_ptr<ITask> task;
-        // 1. Try to get a task from this thread's own queue
+        // 1. Local queue (LIFO when pool has >1 thread)
         {
-            std::lock_guard<std::mutex> qlock(queueMutexes_[index]);
-            if (!taskQueues_[index].empty())
+            std::lock_guard<std::mutex> ql(queueMutexes_[idx]);
+            if (!taskQueues_[idx].empty())
             {
-                // If only one thread, use FIFO (pop_front); otherwise use LIFO (pop_back)
                 if (threadCount_ == 1)
                 {
-                    task = std::move(taskQueues_[index].front());
-                    taskQueues_[index].pop_front();
+                    task = std::move(taskQueues_[idx].front());
+                    taskQueues_[idx].pop_front();
                 }
                 else
                 {
-                    task = std::move(taskQueues_[index].back());
-                    taskQueues_[index].pop_back();
+                    task = std::move(taskQueues_[idx].back());
+                    taskQueues_[idx].pop_back();
                 }
             }
         }
-        // 2. If none, attempt to steal a task from another thread's queue (FIFO order)
-        if (!task)
+        // 2. Steal from another queue (FIFO)
+        if (!task && threadCount_ > 1)
         {
-            for (size_t offset = 1; offset < threadCount_; ++offset)
+            for (std::size_t off = 1; off < threadCount_; ++off)
             {
-                size_t victim = (index + offset) % threadCount_;
-                std::lock_guard<std::mutex> qlock(queueMutexes_[victim]);
+                std::size_t victim = (idx + off) % threadCount_;
+                std::lock_guard<std::mutex> ql(queueMutexes_[victim]);
                 if (!taskQueues_[victim].empty())
                 {
                     task = std::move(taskQueues_[victim].front());
@@ -160,53 +159,25 @@ void ThreadPool::workerThread(size_t index)
 
         if (task)
         {
-            // Execute the retrieved task outside of any locks
             task->run();
-            // Decrement the task counter; if this was the last task, notify waiters
             if (tasksCount_.fetch_sub(1, std::memory_order_acq_rel) == 1)
-            {
                 finishedCV_.notify_all();
-            }
-            // Continue without delay
-            continue;
         }
-        // If no task was found, loop back to waiting.
     }
 }
 
-void ThreadPool::printStatus() const {
-    std::vector<std::tuple<size_t, bool>> queueSnapshots;
-    size_t totalPendingTasks = 0;
+//--------------------------------------------------------------------
+// Debug helper: printStatus()
+//--------------------------------------------------------------------
+void ThreadPool::printStatus() const
+{
+    std::size_t pending = 0;
+    for (const auto &q : taskQueues_)
+        pending += q.size();
 
-    for (size_t i = 0; i < threadCount_; ++i) {
-        std::lock_guard<std::mutex> lock(queueMutexes_[i]);
-        bool isActive = (taskQueues_[i].size() > 0);
-        queueSnapshots.emplace_back(taskQueues_[i].size(), isActive);
-        totalPendingTasks += taskQueues_[i].size();
-    }
-
-    std::cout << "\n[ThreadPool] === Status ===\n";
-    std::cout << "[ThreadPool] Total threads: " << threadCount_ << "\n";
-    std::cout << "[ThreadPool] Accepting tasks: " << (acceptingTasks_.load(std::memory_order_acquire) ? "YES" : "NO") << "\n";
-    std::cout << "[ThreadPool] Stop requested: " << (stopFlag_.load(std::memory_order_acquire) ? "YES" : "NO") << "\n";
-    std::cout << "[ThreadPool] Pause requested: " << (paused_.load(std::memory_order_acquire) ? "YES" : "NO") << "\n";
-    std::cout << "[ThreadPool] Total pending tasks: " << totalPendingTasks << "\n";
-    std::cout << "[ThreadPool] Tasks in progress: " << (tasksCount_.load(std::memory_order_acquire) - totalPendingTasks) << "\n";
-
-    std::cout << "[ThreadPool] Queue status:\n";
-    for (size_t i = 0; i < queueSnapshots.size(); ++i) {
-        std::cout << "  Queue #" << i << ": "
-                  << std::get<0>(queueSnapshots[i]) << " pending tasks, "
-                  << "active=" << (std::get<1>(queueSnapshots[i]) ? "YES" : "NO") << "\n";
-    }
-
-    std::cout << "[ThreadPool] Thread IDs:\n";
-    for (size_t i = 0; i < threads_.size(); ++i) {
-        std::cout << "  Thread #" << i << ": " << threads_[i].get_id() << "\n";
-    }
-
-    std::cout << "[ThreadPool] Current thread: " << std::this_thread::get_id()
-              << (is_worker_thread() ? " (is pool worker)" : " (external)") << "\n";
-
-    std::cout << "[ThreadPool] ========================\n";
+    std::cout << "\n[ThreadPool] Threads: " << threadCount_
+              << "  Pending: " << pending
+              << "  Running: " << (tasksCount_.load() - pending)
+              << "  Accepting: " << (acceptingTasks_ ? "yes" : "no")
+              << "  Paused: " << (paused_ ? "yes" : "no") << std::endl;
 }
