@@ -62,6 +62,15 @@ if(NOT EXISTS ${GTEST_ROOT})
     endif()
 endif()
 
+if(APPLE)
+    # Brew installs googletest such that the config files are typically in:
+    set(GTest_DIR "${GTEST_ROOT}/lib/cmake/GTest")
+elseif(UNIX)
+    # On some Linux systems, config files may be located in a standard cmake directory.
+    # Adjust this path as needed.
+    set(GTest_DIR "/usr/lib/cmake/gtest")
+endif()
+
 # Compiler settings
 set(CMAKE_C_COMPILER /usr/bin/clang)
 set(CMAKE_CXX_COMPILER /usr/bin/clang++)
@@ -71,7 +80,7 @@ include(CTest)
 enable_testing()
 
 # Find GTest package with forced paths
-find_package(GTest REQUIRED PATHS ${GTEST_ROOT} NO_DEFAULT_PATH)
+find_package(GTest REQUIRED PATHS ${GTEST_ROOT} ${GTest_DIR} NO_DEFAULT_PATH)
 find_package(Threads REQUIRED)
 
 # Thread pool library
