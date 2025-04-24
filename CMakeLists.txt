@@ -8,6 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -frtti -arch arm64")
 set(CMAKE_OSX_ARCHITECTURES "arm64")
 
+set(BOOST_ROOT /opt/homebrew/opt/boost)
+set(BOOST_INCLUDE_DIR ${BOOST_ROOT}/include)
+set(BOOST_LIBRARY_THREAD ${BOOST_ROOT}/lib/libboost_thread.a)
+
 # Force set GTest paths (assuming Homebrew installation)
 set(GTEST_ROOT /opt/homebrew/opt/googletest)
 set(GTEST_INCLUDE_DIR ${GTEST_ROOT}/include)
@@ -32,6 +36,7 @@ target_include_directories(thread_pool
     PUBLIC 
     ${CMAKE_SOURCE_DIR}
     ${GTEST_INCLUDE_DIR}
+    ${BOOST_INCLUDE_DIR}
 )
 
 # Test executable
@@ -42,6 +47,7 @@ target_link_libraries(thread_pool_test
     ${GTEST_LIBRARY}
     ${GTEST_MAIN_LIBRARY}
     Threads::Threads
+    ${BOOST_LIBRARY_THREAD}
 )
 
 # Register test

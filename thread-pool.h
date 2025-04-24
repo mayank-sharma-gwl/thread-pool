@@ -16,6 +16,7 @@
 #include <iostream>
 #include <tuple>
 #include <utility>
+#include <algorithm>
 
 class ThreadPool {
 public:
@@ -185,7 +186,7 @@ public:
         std::exception_ptr exception = nullptr; // For exception propagation
 
         for (IndexType chunkStart = start; chunkStart < end; chunkStart += chunkSize) {
-            IndexType chunkEnd = std::min(chunkStart + chunkSize, end);
+            IndexType chunkEnd = std::min(chunkStart + static_cast<IndexType>(chunkSize), end);
 
             // Perfect-forward func into task-specific copy
             auto taskFunc = std::forward<Func>(func);
@@ -225,6 +226,9 @@ public:
     //Instrumentation
     void printStatus() const;
 
+    size_t getThreadCount() const {
+        return threadCount_;
+    }
 private:
     // Abstract task interface for type-erasure
     struct ITask {
