@@ -1,6 +1,7 @@
-#include "thread-pool.h"
+#include "am_thread_pool.h"
 
 thread_local bool ThreadPool::isWorkerThread_ = false;
+
 
 ThreadPool::ThreadPool(size_t threadCount, bool complete_on_destruction)
     : threadCount_(threadCount),
@@ -102,6 +103,9 @@ void ThreadPool::shutdown()
 
 void ThreadPool::workerThread(size_t index)
 {
+    // Store thread ID in the vector at the index position
+    // workerThreadIds_[index] = std::this_thread::get_id();
+
     isWorkerThread_ = true;
     for (;;)
     {
@@ -168,4 +172,41 @@ void ThreadPool::workerThread(size_t index)
         }
         // If no task was found, loop back to waiting.
     }
+}
+
+void ThreadPool::printStatus() const {
+    std::vector<std::tuple<size_t, bool>> queueSnapshots;
+    size_t totalPendingTasks = 0;
+
+    for (size_t i = 0; i < threadCount_; ++i) {
+        std::lock_guard<std::mutex> lock(queueMutexes_[i]);
+        bool isActive = (taskQueues_[i].size() > 0);
+        queueSnapshots.emplace_back(taskQueues_[i].size(), isActive);
+        totalPendingTasks += taskQueues_[i].size();
+    }
+
+    std::cout << "\n[ThreadPool] === Status ===\n";
+    std::cout << "[ThreadPool] Total threads: " << threadCount_ << "\n";
+    std::cout << "[ThreadPool] Accepting tasks: " << (acceptingTasks_.load(std::memory_order_acquire) ? "YES" : "NO") << "\n";
+    std::cout << "[ThreadPool] Stop requested: " << (stopFlag_.load(std::memory_order_acquire) ? "YES" : "NO") << "\n";
+    std::cout << "[ThreadPool] Pause requested: " << (paused_.load(std::memory_order_acquire) ? "YES" : "NO") << "\n";
+    std::cout << "[ThreadPool] Total pending tasks: " << totalPendingTasks << "\n";
+    std::cout << "[ThreadPool] Tasks in progress: " << (tasksCount_.load(std::memory_order_acquire) - totalPendingTasks) << "\n";
+
+    std::cout << "[ThreadPool] Queue status:\n";
+    for (size_t i = 0; i < queueSnapshots.size(); ++i) {
+        std::cout << "  Queue #" << i << ": "
+                  << std::get<0>(queueSnapshots[i]) << " pending tasks, "
+                  << "active=" << (std::get<1>(queueSnapshots[i]) ? "YES" : "NO") << "\n";
+    }
+
+    std::cout << "[ThreadPool] Thread IDs:\n";
+    for (size_t i = 0; i < threads_.size(); ++i) {
+        std::cout << "  Thread #" << i << ": " << threads_[i].get_id() << "\n";
+    }
+
+    std::cout << "[ThreadPool] Current thread: " << std::this_thread::get_id()
+              << (is_worker_thread() ? " (is pool worker)" : " (external)") << "\n";
+
+    std::cout << "[ThreadPool] ========================\n";
 }
