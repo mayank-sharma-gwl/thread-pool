@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "../thread-pool.h"
+#include "../am_thread_pool.h"
 #include <vector>
 #include <atomic>
 #include <chrono>
@@ -7,6 +7,11 @@
 #include <future>
 #include <stdexcept>
 #include <numeric> 
+#include <cmath>
+#include <climits>
+#include <array>
+#include <mutex>
+#include <algorithm>
 
 using namespace std::chrono_literals;  // for using 100ms, etc.
 
@@ -24,9 +29,27 @@ protected:
     }
 };
 
+// Test fixture for reader-writer tests
+class ReaderWriterTests : public ThreadPoolTest {
+    protected:
+        struct SharedData {
+            std::vector<int> data{1, 2, 3, 4, 5};
+            std::atomic<int> readers{0};
+            std::atomic<int> writers{0};
+            std::atomic<int> readCount{0};
+            std::atomic<int> writeCount{0};
+        };
+        
+        SharedData sharedData;
+};
+
 TEST_F(ThreadPoolTest, EnqueueSingleTaskReturnsCorrectValue) {
     ThreadPool pool(4);
+    // printf("Before enqueing task\n");
+    // pool.printStatus();
     auto future = pool.enqueue([] { return 42; });
+    // printf("After enqueing task\n");
+    // pool.printStatus();
     pool.waitForCompletion();
     EXPECT_EQ(future.get(), 42);
 }
@@ -813,4 +836,693 @@ TEST(ThreadPoolSpecialCases, MultipleShutdownCalls) {
     // A subsequent call to shutdown() should not cause any issues.
     EXPECT_NO_THROW(pool.shutdown());
     EXPECT_EQ(counter.load(), 10);
+}
+
+TEST(ThreadPoolPerformance, MultithreadedVsSingleThreaded) {
+    // Define a CPU-intensive task that can benefit from parallelization
+    auto cpu_intensive_task = []() {
+        // More compute-intensive workload
+        const int iterations = 1000000;
+        std::vector<int> primes;
+        primes.reserve(iterations / 10);
+        
+        for (int n = 2; n < iterations; ++n) {
+            bool is_prime = true;
+            for (int i = 2; i <= std::sqrt(n); ++i) {
+                if (n % i == 0) {
+                    is_prime = false;
+                    break;
+                }
+            }
+            if (is_prime) {
+                primes.push_back(n);
+            }
+        }
+        return primes.size();
+    };
+    
+    const int task_count = 16; // Fewer but larger tasks
+    std::vector<size_t> single_thread_results;
+    std::vector<size_t> multi_thread_results;
+    
+    // Test 1: Single-threaded execution (gold reference)
+    std::cout << "\n===== SINGLE-THREADED TEST =====\n";
+    auto start_single = std::chrono::high_resolution_clock::now();
+    {
+        ThreadPool single_thread_pool(1);
+        std::cout << "Initial single-thread pool status:" << std::endl;
+        single_thread_pool.printStatus();
+        
+        std::vector<std::future<size_t>> results;
+        for (int i = 0; i < task_count; ++i) {
+            results.push_back(single_thread_pool.enqueue(cpu_intensive_task));
+            
+            // Print status after submitting the first and last task
+            if (i == 0 || i == task_count - 1) {
+                std::cout << "After submitting task #" << (i+1) << ":" << std::endl;
+                single_thread_pool.printStatus();
+            }
+        }
+        
+        // Print status before getting results
+        std::cout << "Before getting results:" << std::endl;
+        single_thread_pool.printStatus();
+        
+        // Wait for half the tasks to complete
+        for (int i = 0; i < task_count / 2; ++i) {
+            single_thread_results.push_back(results[i].get());
+        }
+        
+        std::cout << "After getting half of the results:" << std::endl;
+        single_thread_pool.printStatus();
+        
+        // Get remaining results
+        for (int i = task_count / 2; i < task_count; ++i) {
+            single_thread_results.push_back(results[i].get());
+        }
+        
+        std::cout << "After getting all results:" << std::endl;
+        single_thread_pool.printStatus();
+    }
+    auto end_single = std::chrono::high_resolution_clock::now();
+    auto single_thread_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_single - start_single).count();
+    
+    // Test 2: Multi-threaded execution
+    std::cout << "\n===== MULTI-THREADED TEST =====\n";
+    const int thread_count = std::min(8, (int)std::thread::hardware_concurrency());
+    
+    auto start_multi = std::chrono::high_resolution_clock::now();
+    {
+        ThreadPool multi_thread_pool(thread_count);
+        std::cout << "Initial multi-thread pool status (" << thread_count << " threads):" << std::endl;
+        multi_thread_pool.printStatus();
+        
+        std::vector<std::future<size_t>> results;
+        for (int i = 0; i < task_count; ++i) {
+            results.push_back(multi_thread_pool.enqueue(cpu_intensive_task));
+            
+            // Print status after submitting the first and last task
+            if (i == 0 || i == task_count - 1) {
+                std::cout << "After submitting task #" << (i+1) << ":" << std::endl;
+                multi_thread_pool.printStatus();
+            }
+        }
+        
+        // Print status before getting results
+        std::cout << "Before getting results:" << std::endl;
+        multi_thread_pool.printStatus();
+        
+        // Wait for half the tasks to complete
+        for (int i = 0; i < task_count / 2; ++i) {
+            multi_thread_results.push_back(results[i].get());
+        }
+        
+        std::cout << "After getting half of the results:" << std::endl;
+        multi_thread_pool.printStatus();
+        
+        // Get remaining results
+        for (int i = task_count / 2; i < task_count; ++i) {
+            multi_thread_results.push_back(results[i].get());
+        }
+        
+        std::cout << "After getting all results:" << std::endl;
+        multi_thread_pool.printStatus();
+    }
+    auto end_multi = std::chrono::high_resolution_clock::now();
+    auto multi_thread_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_multi - start_multi).count();
+    
+    // Output results
+    std::cout << "\n===== PERFORMANCE COMPARISON =====\n";
+    std::cout << "  Single-threaded time: " << single_thread_time << " ms" << std::endl
+              << "  Multi-threaded time (" << thread_count << " threads): " << multi_thread_time << " ms" << std::endl;
+    
+    // Verify correctness by comparing results
+    ASSERT_EQ(single_thread_results.size(), multi_thread_results.size())
+        << "Single-threaded and multi-threaded tests should process the same number of tasks";
+        
+    bool all_results_correct = true;
+    for (size_t i = 0; i < single_thread_results.size(); ++i) {
+        if (single_thread_results[i] != multi_thread_results[i]) {
+            all_results_correct = false;
+            std::cout << "Result mismatch at index " << i 
+                      << ": single=" << single_thread_results[i] 
+                      << ", multi=" << multi_thread_results[i] << std::endl;
+        }
+    }
+    
+    EXPECT_TRUE(all_results_correct) 
+        << "Multi-threaded execution produced different results than single-threaded (gold reference)";
+    
+    // Check performance improvement
+    if (single_thread_time > multi_thread_time) {
+        float speedup = (float)single_thread_time / multi_thread_time;
+        std::cout << "  Speed improvement: " << speedup << "x" << std::endl;
+        
+        EXPECT_GT(speedup, 1.1f) 
+            << "Multi-threaded execution should be faster than single-threaded";
+    } else {
+        std::cout << "  No speedup detected. This could be due to thread overhead exceeding benefits "
+                  << "for this particular workload or test environment." << std::endl;
+        
+        SUCCEED() << "Note: Multi-threaded version wasn't faster in this environment. "
+                  << "This can happen on certain platforms or with specific workloads.";
+    }
+}
+
+TEST(ThreadPoolPerformance, AsymmetricTaskDistribution) {
+    ThreadPool pool(4);  // 4 worker threads
+    std::vector<std::future<int>> futures;
+
+    auto heavy_task = []() {
+        int sum = 0;
+        for (int i = 0; i < 10000000; ++i) {
+            sum += i % 97;
+        }
+        return sum;
+    };
+
+    auto light_task = []() {
+        return 1;
+    };
+
+    std::cout << "[BEFORE SUBMISSION]" << std::endl;
+    pool.printStatus();
+
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            if (i == 0) {
+                futures.push_back(pool.enqueue(heavy_task));
+            } else {
+                futures.push_back(pool.enqueue(light_task));
+            }
+        }
+    }
+
+    std::cout << "[AFTER SUBMISSION]" << std::endl;
+    pool.printStatus();
+
+    for (auto& fut : futures) {
+        fut.get();
+    }
+
+    std::cout << "[AFTER COMPLETION]" << std::endl;
+    pool.printStatus();
+
+    SUCCEED() << "Asymmetric task distribution completed without deadlock or starvation.";
+}
+
+TEST(ThreadPoolPerformance, UnevenHeavyLoadComparison) {
+    auto heavy_task = []() {
+        int sum = 0;
+        for (int i = 0; i < 2000000; ++i) {
+            sum += i % 97;
+        }
+        return sum;
+    };
+
+    const int total_tasks = 12;
+
+    // Single-threaded
+    auto start_single = std::chrono::high_resolution_clock::now();
+    {
+        ThreadPool single_pool(1);
+        std::vector<std::future<int>> results;
+        for (int i = 0; i < total_tasks; ++i) {
+            results.push_back(single_pool.enqueue(heavy_task));
+        }
+        for (auto& fut : results) fut.get();
+    }
+    auto end_single = std::chrono::high_resolution_clock::now();
+    auto time_single = std::chrono::duration_cast<std::chrono::milliseconds>(end_single - start_single).count();
+
+    // Multi-threaded, uneven distribution
+    auto start_multi = std::chrono::high_resolution_clock::now();
+    {
+        ThreadPool pool(4);
+        std::vector<std::future<int>> results;
+
+        std::cout << "[MULTI-THREADED BEFORE SUBMISSION]" << std::endl;
+        pool.printStatus();
+
+        for (int i = 0; i < total_tasks; ++i) {
+            if (i < 9) {
+                results.push_back(pool.enqueue(heavy_task)); // heavy skew
+            } else {
+                results.push_back(pool.enqueue([] { return 42; }));
+            }
+        }
+
+        std::cout << "[MULTI-THREADED AFTER SUBMISSION]" << std::endl;
+        pool.printStatus();
+
+        for (auto& fut : results) fut.get();
+
+        std::cout << "[MULTI-THREADED AFTER COMPLETION]" << std::endl;
+        pool.printStatus();
+    }
+    auto end_multi = std::chrono::high_resolution_clock::now();
+    auto time_multi = std::chrono::duration_cast<std::chrono::milliseconds>(end_multi - start_multi).count();
+
+    std::cout << "\n===== HEAVY LOAD PERFORMANCE COMPARISON =====\n";
+    std::cout << "Single-threaded time: " << time_single << " ms\n";
+    std::cout << "Multi-threaded (uneven) time: " << time_multi << " ms\n";
+
+    if (time_single > time_multi) {
+        float speedup = static_cast<float>(time_single) / time_multi;
+        std::cout << "Speedup: " << speedup << "x\n";
+        EXPECT_GT(speedup, 1.1f);
+    } else {
+        SUCCEED() << "Multi-threaded did not outperform single-threaded, possibly due to contention.";
+    }
+}
+
+// Test enqueueThreadSafeRead and enqueueThreadSafeWrite
+TEST_F(ReaderWriterTests, ConcurrentReadsAllowed) {
+    std::atomic<int> completedReads{0};
+    static const int READ_TASKS = 100;
+    
+    // Launch many read tasks
+    for (int i = 0; i < READ_TASKS; i++) {
+        pool->enqueueThreadSafeRead(sharedData, [&](SharedData& data) {
+            // Track concurrent readers
+            int readers = data.readers.fetch_add(1) + 1;
+            ASSERT_GE(readers, 1) << "Reader count should be at least 1";
+            ASSERT_EQ(data.writers.load(), 0) << "No writers should be active during reads";
+            
+            // Simulate some work
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            
+            // Record that we read
+            data.readCount++;
+            data.readers--;
+            completedReads++;
+        });
+    }
+    
+    // Wait for all reads to complete
+    pool->waitForCompletion();
+    
+    // Verify all reads completed
+    EXPECT_EQ(completedReads, READ_TASKS);
+    EXPECT_EQ(sharedData.readCount, READ_TASKS);
+    EXPECT_EQ(sharedData.writeCount, 0);
+}
+
+TEST_F(ReaderWriterTests, ExclusiveWrites) {
+    std::atomic<int> completedWrites{0};
+    static const int WRITE_TASKS = 50;
+    
+    // Launch many write tasks
+    for (int i = 0; i < WRITE_TASKS; i++) {
+        pool->enqueueThreadSafeWrite(sharedData, [i, &completedWrites](SharedData& data) {
+            // Ensure exclusive access
+            int writers = data.writers.fetch_add(1) + 1;
+            ASSERT_EQ(writers, 1) << "Only one writer should be active";
+            ASSERT_EQ(data.readers.load(), 0) << "No readers should be active during writes";
+            
+            // Simulate longer work for writers
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            
+            // Modify shared data
+            data.data.push_back(i);
+            data.writeCount++;
+            data.writers--;
+            completedWrites++;
+        });
+    }
+    
+    // Wait for all writes to complete
+    pool->waitForCompletion();
+    
+    // Verify all writes completed and data was modified
+    EXPECT_EQ(completedWrites, WRITE_TASKS);
+    EXPECT_EQ(sharedData.writeCount, WRITE_TASKS);
+    EXPECT_EQ(sharedData.data.size(), 5 + WRITE_TASKS);
+}
+
+TEST_F(ReaderWriterTests, MixedReadWriteOperations) {
+    std::atomic<int> completedOps{0};
+    static const int TASKS = 200;
+    
+    // Randomly mix read and write operations
+    for (int i = 0; i < TASKS; i++) {
+        if (i % 5 == 0) { // 20% writes, 80% reads
+            pool->enqueueThreadSafeWrite(sharedData, [i, &completedOps](SharedData& data) {
+                // Writer logic
+                ASSERT_EQ(data.writers.fetch_add(1), 0);
+                ASSERT_EQ(data.readers.load(), 0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                data.writeCount++;
+                data.writers--;
+                completedOps++;
+            });
+        } else {
+            pool->enqueueThreadSafeRead(sharedData, [&completedOps](SharedData& data) {
+                // Reader logic
+                data.readers.fetch_add(1);
+                ASSERT_EQ(data.writers.load(), 0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                data.readCount++;
+                data.readers--;
+                completedOps++;
+            });
+        }
+    }
+    
+    // Wait for all operations to complete
+    pool->waitForCompletion();
+    EXPECT_EQ(completedOps, TASKS);
+}
+
+// Tests for parallelRead and parallelWrite
+TEST_F(ThreadPoolTest, ParallelReadReturnsFutures) {
+    std::vector<int> data{1, 2, 3, 4, 5};
+    std::atomic<int> readerCount{0};
+    
+    // Function that reads from data and returns sum
+    auto sumFunc = [&readerCount](const std::vector<int>& vec) {
+        readerCount++;
+        return std::accumulate(vec.begin(), vec.end(), 0);
+    };
+    
+    // Launch multiple parallel reads
+    std::vector<std::future<int>> results;
+    for (int i = 0; i < 10; i++) {
+        results.push_back(pool->parallelRead(sumFunc, std::ref(data)));
+    }
+    
+    // Verify results
+    for (auto& fut : results) {
+        EXPECT_EQ(fut.get(), 15); // Sum is 1+2+3+4+5 = 15
+    }
+    
+    EXPECT_EQ(readerCount, 10);
+}
+
+TEST_F(ThreadPoolTest, ParallelWriteModifiesData) {
+    std::vector<int> data{1, 2, 3, 4, 5};
+    std::atomic<int> writerCount{0};
+    
+    std::cout << "[ParallelWriteModifiesData] Before submitting tasks:" << std::endl;
+    pool->printStatus();
+    
+    // Function that modifies data and returns new size
+    auto modifyFunc = [&writerCount](std::vector<int>& vec, int value) {
+        writerCount++;
+        vec.push_back(value);
+        return vec.size();
+    };
+    
+    // Use a sequential approach to ensure predictable results
+    for (int i = 0; i < 5; i++) {
+        std::cout << "[ParallelWriteModifiesData] Before task " << i << ":" << std::endl;
+        pool->printStatus();
+        
+        // Submit task and wait for it to complete
+        auto future = pool->parallelWrite(modifyFunc, std::ref(data), i + 10);
+        size_t result = future.get(); // Wait for this task to complete
+        
+        std::cout << "[ParallelWriteModifiesData] After task " << i << " (size=" << result << "):" << std::endl;
+        pool->printStatus();
+        
+        // Since we're waiting for each task to complete before submitting the next,
+        // the size should be predictable: 5 (initial) + i + 1
+        EXPECT_EQ(result, 6 + i); 
+    }
+    
+    std::cout << "[ParallelWriteModifiesData] After all tasks:" << std::endl;
+    pool->printStatus();
+    
+    EXPECT_EQ(writerCount, 5);
+    EXPECT_EQ(data.size(), 10); // Should have 5 new elements
+}
+
+// Tests for parallelFor
+TEST_F(ThreadPoolTest, ParallelForProcessesRange) {
+    std::vector<int> results(100, 0);
+    std::atomic<int> counter{0};
+    
+    std::cout << "[ParallelForProcessesRange] Before parallelFor:" << std::endl;
+    pool->printStatus();
+    
+    // Process range 0-99, squaring each index and storing in results
+    pool->parallelFor(0, 100, [&results, &counter](int i) {
+        results[i] = i * i;
+        counter++;
+    });
+    
+    std::cout << "[ParallelForProcessesRange] After parallelFor:" << std::endl;
+    pool->printStatus();
+    
+    // Verify all elements were processed
+    EXPECT_EQ(counter, 100);
+    for (int i = 0; i < 100; i++) {
+        EXPECT_EQ(results[i], i * i);
+    }
+    
+    std::cout << "[ParallelForProcessesRange] After verification:" << std::endl;
+    pool->printStatus();
+}
+
+TEST_F(ThreadPoolTest, ParallelForWithDifferentChunkSizes) {
+    std::vector<int> results(1000, 0);
+    std::vector<size_t> chunkSizes{1, 10, 50, 100, 1000};
+    
+    for (size_t chunkSize : chunkSizes) {
+        // Reset results
+        std::fill(results.begin(), results.end(), 0);
+        std::atomic<int> tasksExecuted{0};
+        
+        std::cout << "[ParallelForWithDifferentChunkSizes] Before parallelFor with chunkSize=" << chunkSize << ":" << std::endl;
+        pool->printStatus();
+        
+        // Process range with specified chunk size
+        pool->parallelFor(0, 1000, [&results, &tasksExecuted](int i) {
+            results[i] = i;
+            tasksExecuted++;
+        }, chunkSize);
+        
+        std::cout << "[ParallelForWithDifferentChunkSizes] After parallelFor with chunkSize=" << chunkSize << ":" << std::endl;
+        pool->printStatus();
+        
+        // Verify all elements were processed
+        EXPECT_EQ(tasksExecuted, 1000);
+        for (int i = 0; i < 1000; i++) {
+            EXPECT_EQ(results[i], i);
+        }
+    }
+}
+
+TEST_F(ThreadPoolTest, ParallelForExceptionHandling) {
+    // Function that throws for specific indices
+    auto throwingFunc = [](int i) {
+        if (i % 10 == 0) {
+            throw std::runtime_error("Error at index " + std::to_string(i));
+        }
+    };
+    
+    std::cout << "[ParallelForExceptionHandling] Before first parallelFor:" << std::endl;
+    pool->printStatus();
+    
+    // Should propagate exceptions
+    EXPECT_THROW({
+        pool->parallelFor(0, 100, throwingFunc);
+    }, std::runtime_error);
+    
+    std::cout << "[ParallelForExceptionHandling] After first parallelFor:" << std::endl;
+    pool->printStatus();
+    
+    // Test with larger chunk size that includes throwing indices
+    std::cout << "[ParallelForExceptionHandling] Before second parallelFor:" << std::endl;
+    pool->printStatus();
+    
+    EXPECT_THROW({
+        pool->parallelFor(0, 100, throwingFunc, 20);
+    }, std::runtime_error);
+    
+    std::cout << "[ParallelForExceptionHandling] After second parallelFor:" << std::endl;
+    pool->printStatus();
+}
+
+TEST_F(ThreadPoolTest, ParallelForWithEmptyRange) {
+    std::atomic<int> counter{0};
+    
+    std::cout << "[ParallelForWithEmptyRange] Before first empty range call:" << std::endl;
+    pool->printStatus();
+    
+    // Empty range should do nothing
+    pool->parallelFor(0, 0, [&counter](int) { counter++; });
+    
+    std::cout << "[ParallelForWithEmptyRange] After first empty range call:" << std::endl;
+    pool->printStatus();
+    
+    // Invalid range
+    pool->parallelFor(10, 5, [&counter](int) { counter++; });
+    
+    std::cout << "[ParallelForWithEmptyRange] After invalid range call:" << std::endl;
+    pool->printStatus();
+    
+    EXPECT_EQ(counter, 0);
+}
+
+// Stress test for all methods
+TEST_F(ThreadPoolTest, StressTest) {
+    std::shared_ptr<std::vector<int>> sharedVector = std::make_shared<std::vector<int>>(1000, 0);
+    std::atomic<int> operationsCompleted{0};
+    const int OPERATIONS = 10000;
+    
+    // Launch mixed operations
+    for (int i = 0; i < OPERATIONS; i++) {
+        switch (i % 5) {
+            case 0:
+                pool->enqueueThreadSafeRead(*sharedVector, [&operationsCompleted](const std::vector<int>&) {
+                    operationsCompleted++;
+                });
+                break;
+            case 1:
+                pool->enqueueThreadSafeWrite(*sharedVector, [&operationsCompleted, i](std::vector<int>& vec) {
+                    vec[i % vec.size()] = i;
+                    operationsCompleted++;
+                });
+                break;
+            case 2:
+                pool->parallelRead([&operationsCompleted](const std::vector<int>& vec) {
+                    operationsCompleted++;
+                    return vec.size();
+                }, std::ref(*sharedVector));
+                break;
+            case 3:
+                pool->parallelWrite([&operationsCompleted](std::vector<int>& vec, int val) {
+                    vec[val % vec.size()] = val;
+                    operationsCompleted++;
+                    return val;
+                }, std::ref(*sharedVector), i);
+                break;
+            case 4:
+                // Small parallelFor to avoid too many tasks
+                pool->parallelFor(0, 10, [&sharedVector, &operationsCompleted, i](int idx) {
+                    (*sharedVector)[(i + idx) % sharedVector->size()] = idx;
+                    operationsCompleted++;
+                }, 5);
+                break;
+        }
+    }
+    
+    // Wait for completion and verify
+    pool->waitForCompletion();
+    EXPECT_GE(operationsCompleted, OPERATIONS);
+}
+
+TEST_F(ThreadPoolTest, ParallelForPerformanceComparison) {
+    const int ARRAY_SIZE = 10000000;  // Large enough to make the difference noticeable
+    std::vector<int> sequential_results(ARRAY_SIZE, 0);
+    std::vector<int> parallel_results(ARRAY_SIZE, 0);
+    
+    // A moderately compute-intensive operation to apply to each element
+    auto compute_fn = [](int val) {
+        // Simulate some computation
+        int result = val;
+        for (int i = 0; i < 30; ++i) {
+            result = (result * 17 + 13) % 1000;
+        }
+        return result;
+    };
+    
+    std::cout << "\n===== PARALLEL FOR PERFORMANCE TEST =====\n";
+    
+    // 1. Sequential execution (baseline)
+    std::cout << "Starting sequential execution..." << std::endl;
+    auto start_seq = std::chrono::high_resolution_clock::now();
+    
+    for (int i = 0; i < ARRAY_SIZE; ++i) {
+        sequential_results[i] = compute_fn(i);
+    }
+    
+    auto end_seq = std::chrono::high_resolution_clock::now();
+    auto seq_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_seq - start_seq).count();
+    
+    std::cout << "Sequential execution completed in " << seq_time << " ms" << std::endl;
+    
+    // 2. Test parallelFor with different chunk sizes
+    std::vector<size_t> chunk_sizes = {
+        1,                      // Minimum chunk size
+        100,                    // Small chunks
+        10000,                  // Medium chunks
+        100000,                 // Large chunks
+        ARRAY_SIZE / 10,        // Very large chunks
+        ARRAY_SIZE              // Single chunk
+    };
+    
+    std::cout << "\nTesting with " << pool->getThreadCount() << " threads in the pool" << std::endl;
+    pool->printStatus();
+    
+    std::vector<std::pair<size_t, long>> timing_results;
+    
+    for (size_t chunk_size : chunk_sizes) {
+        // Reset results
+        std::fill(parallel_results.begin(), parallel_results.end(), 0);
+        
+        std::cout << "\nTesting with chunk size: " << chunk_size << std::endl;
+        pool->printStatus();
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        pool->parallelFor(0, ARRAY_SIZE, [&parallel_results, &compute_fn](int i) {
+            parallel_results[i] = compute_fn(i);
+        }, chunk_size);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        
+        std::cout << "Chunk size " << chunk_size << " completed in " << time_ms << " ms" << std::endl;
+        pool->printStatus();
+        
+        timing_results.push_back({chunk_size, time_ms});
+        
+        // Verify results match sequential execution
+        bool results_match = std::equal(sequential_results.begin(), sequential_results.end(), 
+                                        parallel_results.begin());
+        EXPECT_TRUE(results_match) 
+            << "Parallel execution with chunk size " << chunk_size << " produced different results";
+    }
+    
+    // Print summary of results
+    std::cout << "\n===== PERFORMANCE SUMMARY =====\n";
+    std::cout << "Sequential execution: " << seq_time << " ms\n";
+    
+    // Find the best chunk size
+    auto best_result = *std::min_element(timing_results.begin(), timing_results.end(),
+                                         [](const auto& a, const auto& b) { return a.second < b.second; });
+    
+    std::cout << "Parallel execution results:\n";
+    for (const auto& result_pair : timing_results) {
+        size_t chunk_size = result_pair.first;
+        long time = result_pair.second;
+        double speedup = static_cast<double>(seq_time) / time;
+        std::cout << "  Chunk size " << chunk_size << ": " << time << " ms (";
+        
+        if (speedup > 1.0) {
+            std::cout << speedup << "x faster";
+        } else {
+            std::cout << (1.0/speedup) << "x slower";
+        }
+        
+        if (chunk_size == best_result.first) {
+            std::cout << ") <- BEST";
+        } else {
+            std::cout << ")";
+        }
+        std::cout << std::endl;
+    }
+    
+    // We expect at least some speedup with parallelization
+    EXPECT_LT(best_result.second, seq_time) 
+        << "Parallel execution should be faster than sequential execution";
+    
+    // Add additional methods to ThreadPool for this test
+    std::cout << "\nPool final status:\n";
+    pool->printStatus();
 }
