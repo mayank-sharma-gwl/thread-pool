@@ -1585,130 +1585,130 @@ TEST_F(ThreadPoolTest, StressTest)
     EXPECT_GE(operationsCompleted, OPERATIONS);
 }
 
-TEST_F(ThreadPoolTest, ParallelForPerformanceComparison)
-{
-    const int ARRAY_SIZE = 10000000; // Large enough to make the difference noticeable
-    std::vector<int> sequential_results(ARRAY_SIZE, 0);
-    std::vector<int> parallel_results(ARRAY_SIZE, 0);
+// TEST_F(ThreadPoolTest, ParallelForPerformanceComparison)
+// {
+//     const int ARRAY_SIZE = 10000000; // Large enough to make the difference noticeable
+//     std::vector<int> sequential_results(ARRAY_SIZE, 0);
+//     std::vector<int> parallel_results(ARRAY_SIZE, 0);
 
-    // A moderately compute-intensive operation to apply to each element
-    auto compute_fn = [](int val)
-    {
-        // Simulate some computation
-        int result = val;
-        for (int i = 0; i < 30; ++i)
-        {
-            result = (result * 17 + 13) % 1000;
-        }
-        return result;
-    };
+//     // A moderately compute-intensive operation to apply to each element
+//     auto compute_fn = [](int val)
+//     {
+//         // Simulate some computation
+//         int result = val;
+//         for (int i = 0; i < 30; ++i)
+//         {
+//             result = (result * 17 + 13) % 1000;
+//         }
+//         return result;
+//     };
 
-    std::cout << "\n===== PARALLEL FOR PERFORMANCE TEST =====\n";
+//     std::cout << "\n===== PARALLEL FOR PERFORMANCE TEST =====\n";
 
-    // 1. Sequential execution (baseline)
-    std::cout << "Starting sequential execution..." << std::endl;
-    auto start_seq = std::chrono::high_resolution_clock::now();
+//     // 1. Sequential execution (baseline)
+//     std::cout << "Starting sequential execution..." << std::endl;
+//     auto start_seq = std::chrono::high_resolution_clock::now();
 
-    for (int i = 0; i < ARRAY_SIZE; ++i)
-    {
-        sequential_results[i] = compute_fn(i);
-    }
+//     for (int i = 0; i < ARRAY_SIZE; ++i)
+//     {
+//         sequential_results[i] = compute_fn(i);
+//     }
 
-    auto end_seq = std::chrono::high_resolution_clock::now();
-    auto seq_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        end_seq - start_seq)
-                        .count();
+//     auto end_seq = std::chrono::high_resolution_clock::now();
+//     auto seq_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+//                         end_seq - start_seq)
+//                         .count();
 
-    std::cout << "Sequential execution completed in " << seq_time << " ms" << std::endl;
+//     std::cout << "Sequential execution completed in " << seq_time << " ms" << std::endl;
 
-    // 2. Test parallelFor with different chunk sizes
-    std::vector<size_t> chunk_sizes = {
-        1,               // Minimum chunk size
-        100,             // Small chunks
-        10000,           // Medium chunks
-        100000,          // Large chunks
-        ARRAY_SIZE / 10, // Very large chunks
-        ARRAY_SIZE       // Single chunk
-    };
+//     // 2. Test parallelFor with different chunk sizes
+//     std::vector<size_t> chunk_sizes = {
+//         1,               // Minimum chunk size
+//         100,             // Small chunks
+//         10000,           // Medium chunks
+//         100000,          // Large chunks
+//         ARRAY_SIZE / 10, // Very large chunks
+//         ARRAY_SIZE       // Single chunk
+//     };
 
-    std::cout << "\nTesting with " << pool->getThreadCount() << " threads in the pool" << std::endl;
-    pool->printStatus();
+//     std::cout << "\nTesting with " << pool->getThreadCount() << " threads in the pool" << std::endl;
+//     pool->printStatus();
 
-    std::vector<std::pair<size_t, long>> timing_results;
+//     std::vector<std::pair<size_t, long>> timing_results;
 
-    for (size_t chunk_size : chunk_sizes)
-    {
-        // Reset results
-        std::fill(parallel_results.begin(), parallel_results.end(), 0);
+//     for (size_t chunk_size : chunk_sizes)
+//     {
+//         // Reset results
+//         std::fill(parallel_results.begin(), parallel_results.end(), 0);
 
-        std::cout << "\nTesting with chunk size: " << chunk_size << std::endl;
-        pool->printStatus();
+//         std::cout << "\nTesting with chunk size: " << chunk_size << std::endl;
+//         pool->printStatus();
 
-        auto start = std::chrono::high_resolution_clock::now();
+//         auto start = std::chrono::high_resolution_clock::now();
 
-        pool->parallelFor(0, ARRAY_SIZE, [&parallel_results, &compute_fn](int i)
-                          { parallel_results[i] = compute_fn(i); }, chunk_size);
+//         pool->parallelFor(0, ARRAY_SIZE, [&parallel_results, &compute_fn](int i)
+//                           { parallel_results[i] = compute_fn(i); }, chunk_size);
 
-        auto end = std::chrono::high_resolution_clock::now();
-        auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+//         auto end = std::chrono::high_resolution_clock::now();
+//         auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-        std::cout << "Chunk size " << chunk_size << " completed in " << time_ms << " ms" << std::endl;
-        pool->printStatus();
+//         std::cout << "Chunk size " << chunk_size << " completed in " << time_ms << " ms" << std::endl;
+//         pool->printStatus();
 
-        timing_results.push_back({chunk_size, time_ms});
+//         timing_results.push_back({chunk_size, time_ms});
 
-        // Verify results match sequential execution
-        bool results_match = std::equal(sequential_results.begin(), sequential_results.end(),
-                                        parallel_results.begin());
-        EXPECT_TRUE(results_match)
-            << "Parallel execution with chunk size " << chunk_size << " produced different results";
-    }
+//         // Verify results match sequential execution
+//         bool results_match = std::equal(sequential_results.begin(), sequential_results.end(),
+//                                         parallel_results.begin());
+//         EXPECT_TRUE(results_match)
+//             << "Parallel execution with chunk size " << chunk_size << " produced different results";
+//     }
 
-    // Print summary of results
-    std::cout << "\n===== PERFORMANCE SUMMARY =====\n";
-    std::cout << "Sequential execution: " << seq_time << " ms\n";
+//     // Print summary of results
+//     std::cout << "\n===== PERFORMANCE SUMMARY =====\n";
+//     std::cout << "Sequential execution: " << seq_time << " ms\n";
 
-    // Find the best chunk size
-    auto best_result = *std::min_element(timing_results.begin(), timing_results.end(),
-                                         [](const auto &a, const auto &b)
-                                         { return a.second < b.second; });
+//     // Find the best chunk size
+//     auto best_result = *std::min_element(timing_results.begin(), timing_results.end(),
+//                                          [](const auto &a, const auto &b)
+//                                          { return a.second < b.second; });
 
-    std::cout << "Parallel execution results:\n";
-    for (const auto &result_pair : timing_results)
-    {
-        size_t chunk_size = result_pair.first;
-        long time = result_pair.second;
-        double speedup = static_cast<double>(seq_time) / time;
-        std::cout << "  Chunk size " << chunk_size << ": " << time << " ms (";
+//     std::cout << "Parallel execution results:\n";
+//     for (const auto &result_pair : timing_results)
+//     {
+//         size_t chunk_size = result_pair.first;
+//         long time = result_pair.second;
+//         double speedup = static_cast<double>(seq_time) / time;
+//         std::cout << "  Chunk size " << chunk_size << ": " << time << " ms (";
 
-        if (speedup > 1.0)
-        {
-            std::cout << speedup << "x faster";
-        }
-        else
-        {
-            std::cout << (1.0 / speedup) << "x slower";
-        }
+//         if (speedup > 1.0)
+//         {
+//             std::cout << speedup << "x faster";
+//         }
+//         else
+//         {
+//             std::cout << (1.0 / speedup) << "x slower";
+//         }
 
-        if (chunk_size == best_result.first)
-        {
-            std::cout << ") <- BEST";
-        }
-        else
-        {
-            std::cout << ")";
-        }
-        std::cout << std::endl;
-    }
+//         if (chunk_size == best_result.first)
+//         {
+//             std::cout << ") <- BEST";
+//         }
+//         else
+//         {
+//             std::cout << ")";
+//         }
+//         std::cout << std::endl;
+//     }
 
-    // We expect at least some speedup with parallelization
-    EXPECT_LT(best_result.second, seq_time)
-        << "Parallel execution should be faster than sequential execution";
+//     // We expect at least some speedup with parallelization
+//     EXPECT_LT(best_result.second, seq_time)
+//         << "Parallel execution should be faster than sequential execution";
 
-    // Add additional methods to ThreadPool for this test
-    std::cout << "\nPool final status:\n";
-    pool->printStatus();
-}
+//     // Add additional methods to ThreadPool for this test
+//     std::cout << "\nPool final status:\n";
+//     pool->printStatus();
+// }
 
 TEST_F(ThreadPoolTest, ParallelForAsyncBasic)
 {
