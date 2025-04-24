@@ -4,72 +4,74 @@ project(thread_pool)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Set default package locations (customize these paths if needed)
+# Set default package locations (customize these paths as needed)
 # These can be overridden by providing -DBOOST_ROOT or -DGTEST_ROOT when invoking CMake.
 if(NOT DEFINED BOOST_ROOT)
-    set(BOOST_ROOT "/opt/homebrew/opt/boost")
+    if(APPLE)
+        set(BOOST_ROOT "/opt/homebrew/opt/boost")
+    elseif(UNIX)
+        # On Ubuntu (GitHub CI), rely on system-installed packages.
+        set(BOOST_ROOT "")
+    endif()
 endif()
+
 if(NOT DEFINED GTEST_ROOT)
-    set(GTEST_ROOT "/opt/homebrew/opt/googletest")
-endif()
-
-set(BOOST_INCLUDE_DIR ${BOOST_ROOT}/include)
-set(BOOST_LIBRARY_THREAD ${BOOST_ROOT}/lib/libboost_thread.a)
-
-set(GTEST_INCLUDE_DIR ${GTEST_ROOT}/include)
-set(GTEST_LIBRARY ${GTEST_ROOT}/lib/libgtest.a)
-set(GTEST_MAIN_LIBRARY ${GTEST_ROOT}/lib/libgtest_main.a)
-
-# Check and install Boost if directory does not exist
-if(NOT EXISTS ${BOOST_ROOT})
-    message(STATUS "Boost not found at ${BOOST_ROOT}, attempting installation...")
     if(APPLE)
-        execute_process(COMMAND brew install boost
-                        RESULT_VARIABLE boost_install_result
-                        OUTPUT_VARIABLE boost_install_output
-                        ERROR_VARIABLE boost_install_error)
+        set(GTEST_ROOT "/opt/homebrew/opt/googletest")
     elseif(UNIX)
-        execute_process(COMMAND sh -c "sudo apt-get update && sudo apt-get install -y libboost-all-dev"
-                        RESULT_VARIABLE boost_install_result
-                        OUTPUT_VARIABLE boost_install_output
-                        ERROR_VARIABLE boost_install_error)
-    elseif(WIN32)
-        message(FATAL_ERROR "Boost not found. Please install Boost manually on Windows.")
-    endif()
-    if(NOT boost_install_result EQUAL 0)
-        message(FATAL_ERROR "Boost installation failed: ${boost_install_error}")
+        # On Ubuntu, GTest is installed via apt, so leave unset.
+        set(GTEST_ROOT "")
     endif()
 endif()
 
-# Check and install GoogleTest if directory does not exist
-if(NOT EXISTS ${GTEST_ROOT})
-    message(STATUS "GoogleTest not found at ${GTEST_ROOT}, attempting installation...")
-    if(APPLE)
-        execute_process(COMMAND brew install googletest
-                        RESULT_VARIABLE gtest_install_result
-                        OUTPUT_VARIABLE gtest_install_output
-                        ERROR_VARIABLE gtest_install_error)
-    elseif(UNIX)
-        execute_process(COMMAND sh -c "sudo apt-get update && sudo apt-get install -y libgtest-dev"
-                        RESULT_VARIABLE gtest_install_result
-                        OUTPUT_VARIABLE gtest_install_output
-                        ERROR_VARIABLE gtest_install_error)
-    elseif(WIN32)
-        message(FATAL_ERROR "GoogleTest not found. Please install GoogleTest manually on Windows.")
-    endif()
-    if(NOT gtest_install_result EQUAL 0)
-        message(FATAL_ERROR "GoogleTest installation failed: ${gtest_install_error}")
+if(BOOST_ROOT STREQUAL "")
+    # Use system defaults found by find_package
+    set(BOOST_INCLUDE_DIR "")
+    set(BOOST_LIBRARY_THREAD "")
+else()
+    set(BOOST_INCLUDE_DIR ${BOOST_ROOT}/include)
+    set(BOOST_LIBRARY_THREAD ${BOOST_ROOT}/lib/libboost_thread.a)
+endif()
+
+if(GTEST_ROOT STREQUAL "")
+    # On Ubuntu, we'll use system paths.
+    set(GTEST_INCLUDE_DIR "")
+    set(GTEST_LIBRARY "")
+    set(GTEST_MAIN_LIBRARY "")
+else()
+    set(GTEST_INCLUDE_DIR ${GTEST_ROOT}/include)
+    set(GTEST_LIBRARY ${GTEST_ROOT}/lib/libgtest.a)
+    set(GTEST_MAIN_LIBRARY ${GTEST_ROOT}/lib/libgtest_main.a)
+endif()
+
+if(APPLE OR WIN32)
+    # For legacy platforms, check and install Boost if not found.
+    if(NOT EXISTS ${BOOST_ROOT})
+        message(STATUS "Boost not found at ${BOOST_ROOT}, attempting installation...")
+        if(APPLE)
+            execute_process(COMMAND brew install boost
+                            RESULT_VARIABLE boost_install_result
+                            OUTPUT_VARIABLE boost_install_output
+                            ERROR_VARIABLE boost_install_error)
+        elseif(WIN32)
+            message(FATAL_ERROR "Boost not found. Please install Boost manually on Windows.")
+        endif()
+        if(NOT boost_install_result EQUAL 0)
+            message(FATAL_ERROR "Boost installation failed: ${boost_install_error}")
+        endif()
     endif()
 endif()
 
 if(APPLE)
-    # Brew installs googletest such that the config files are typically in:
     set(GTest_DIR "${GTEST_ROOT}/lib/cmake/GTest")
 elseif(UNIX)
-    # On some Linux systems, config files may be located in a standard cmake directory.
-    # Adjust this path as needed.
+    # On Ubuntu, GTest is installed via apt and CMake package is located here.
     set(GTest_DIR "/usr/lib/cmake/gtest")
 endif()
+
+find_package(GTest REQUIRED PATHS ${GTEST_ROOT} ${GTest_DIR})
+
+find_package(Threads REQUIRED)
 
 # Compiler settings
 set(CMAKE_C_COMPILER /usr/bin/clang)
@@ -80,7 +82,7 @@ include(CTest)
 enable_testing()
 
 # Find GTest package with forced paths
-find_package(GTest REQUIRED PATHS ${GTEST_ROOT} ${GTest_DIR} NO_DEFAULT_PATH)
+find_package(GTest REQUIRED PATHS ${GTEST_ROOT} ${GTest_DIR})
 find_package(Threads REQUIRED)
 
 # Thread pool library
@@ -97,10 +99,11 @@ add_executable(thread_pool_test test/thread_pool_test.cpp)
 target_link_libraries(thread_pool_test 
     PRIVATE 
     thread_pool
-    ${GTEST_LIBRARY}
-    ${GTEST_MAIN_LIBRARY}
+    GTest::gtest
+    GTest::gtest_main
     Threads::Threads
-    ${BOOST_LIBRARY_THREAD}
+    # If BOOST_LIBRARY_THREAD was set from legacy paths, append it; otherwise, assume find_package(Boost) will be used.
+    $<$<BOOL:${BOOST_LIBRARY_THREAD}>:${BOOST_LIBRARY_THREAD}>
 )
 
 # Register test
