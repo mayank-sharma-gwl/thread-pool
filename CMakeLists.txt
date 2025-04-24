@@ -29,7 +29,7 @@ if(NOT EXISTS ${BOOST_ROOT})
                         OUTPUT_VARIABLE boost_install_output
                         ERROR_VARIABLE boost_install_error)
     elseif(UNIX)
-        execute_process(COMMAND sudo apt-get update && sudo apt-get install -y libboost-all-dev
+        execute_process(COMMAND sh -c "sudo apt-get update && sudo apt-get install -y libboost-all-dev"
                         RESULT_VARIABLE boost_install_result
                         OUTPUT_VARIABLE boost_install_output
                         ERROR_VARIABLE boost_install_error)
@@ -50,7 +50,7 @@ if(NOT EXISTS ${GTEST_ROOT})
                         OUTPUT_VARIABLE gtest_install_output
                         ERROR_VARIABLE gtest_install_error)
     elseif(UNIX)
-        execute_process(COMMAND sudo apt-get update && sudo apt-get install -y libgtest-dev
+        execute_process(COMMAND sh -c "sudo apt-get update && sudo apt-get install -y libgtest-dev"
                         RESULT_VARIABLE gtest_install_result
                         OUTPUT_VARIABLE gtest_install_output
                         ERROR_VARIABLE gtest_install_error)
