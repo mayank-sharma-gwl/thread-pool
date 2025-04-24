@@ -28,6 +28,9 @@ if(BOOST_ROOT STREQUAL "")
     # Use system defaults found by find_package
     set(BOOST_INCLUDE_DIR "")
     set(BOOST_LIBRARY_THREAD "")
+    # On Ubuntu/GitHub CI, use the system's Boost installation.
+    find_package(Boost REQUIRED COMPONENTS thread)
+    set(BOOST_INCLUDE_DIR ${Boost_INCLUDE_DIRS})
 else()
     set(BOOST_INCLUDE_DIR ${BOOST_ROOT}/include)
     set(BOOST_LIBRARY_THREAD ${BOOST_ROOT}/lib/libboost_thread.a)
@@ -102,8 +105,9 @@ target_link_libraries(thread_pool_test
     GTest::gtest
     GTest::gtest_main
     Threads::Threads
-    # If BOOST_LIBRARY_THREAD was set from legacy paths, append it; otherwise, assume find_package(Boost) will be used.
+    # If legacy BOOST_LIBRARY_THREAD is defined, use it; otherwise, use the imported target Boost::thread.
     $<$<BOOL:${BOOST_LIBRARY_THREAD}>:${BOOST_LIBRARY_THREAD}>
+    $<$<NOT:$<BOOL:${BOOST_LIBRARY_THREAD}>>:Boost::thread>
 )
 
 # Register test
