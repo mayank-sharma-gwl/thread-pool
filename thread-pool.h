@@ -121,6 +121,55 @@ public:
     typename std::enable_if<!std::is_void<typename std::result_of<Func(Index)>::type>::value, std::vector<typename std::result_of<Func(Index)>::type>>::type
     parallelFor(Index first, Index last, Func &&func, std::size_t chunk = 1);
 
+    // Overload for any container (void return type)
+    template <typename Container, typename Func>
+    typename std::enable_if<std::is_void<typename std::result_of<Func(typename Container::value_type&)>::type>::value, void>::type
+    parallelFor(Container& container, Func&& func, std::size_t minChunkSize = 1) 
+    {
+        if (container.empty())
+            return;
+            
+        // Create a vector of iterators for random access
+        std::vector<typename Container::iterator> iterators;
+        iterators.reserve(std::distance(container.begin(), container.end()));
+        
+        for (auto it = container.begin(); it != container.end(); ++it) {
+            iterators.push_back(it);
+        }
+        
+        // Use the existing parallelFor with the iterator vector
+        parallelFor(static_cast<size_t>(0), iterators.size(), 
+            [&iterators, func = std::forward<Func>(func)](size_t i) {
+                func(*(iterators[i]));
+            }, minChunkSize);
+    }
+
+    // Overload for any container (with return values)
+    template <typename Container, typename Func>
+    typename std::enable_if<!std::is_void<typename std::result_of<Func(typename Container::value_type&)>::type>::value, 
+                            std::vector<typename std::result_of<Func(typename Container::value_type&)>::type>>::type
+    parallelFor(Container& container, Func&& func, std::size_t minChunkSize = 1)
+    {
+        if (container.empty())
+            return {};
+            
+        using ResultType = typename std::result_of<Func(typename Container::value_type&)>::type;
+        
+        // Create a vector of iterators for random access
+        std::vector<typename Container::iterator> iterators;
+        iterators.reserve(std::distance(container.begin(), container.end()));
+        
+        for (auto it = container.begin(); it != container.end(); ++it) {
+            iterators.push_back(it);
+        }
+        
+        // Use the existing parallelFor with the iterator vector
+        return parallelFor(static_cast<size_t>(0), iterators.size(), 
+            [&iterators, func = std::forward<Func>(func)](size_t i) -> ResultType {
+                return func(*(iterators[i]));
+            }, minChunkSize);
+    }
+
     // legacy API wrapper returning MultiFuture for convenience
     template <typename Index, typename Func>
     MultiFuture<void> parallelForAsync(Index first, Index last, Func &&func, std::size_t chunk = 1);
