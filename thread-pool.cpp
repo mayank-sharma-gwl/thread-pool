@@ -37,13 +37,22 @@ ThreadPool::~ThreadPool()
 //--------------------------------------------------------------------
 void ThreadPool::pause()
 {
+    std::unique_lock<std::mutex> lock(masterMutex_);
     paused_.store(true, std::memory_order_relaxed);
+    // No need to notify here; workers will check `paused_` in their wait predicate
 }
 
 void ThreadPool::resume()
 {
-    if (!paused_.exchange(false, std::memory_order_relaxed))
-        return;
+    {
+        std::unique_lock<std::mutex> lock(masterMutex_);
+        if (!paused_.load(std::memory_order_relaxed))
+        {
+            return; // already running
+        }
+        paused_.store(false, std::memory_order_relaxed);
+    }
+    // Wake all workers so they re-evaluate the pause condition
     tasksCV_.notify_all();
 }
 
