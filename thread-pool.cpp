@@ -29,6 +29,10 @@ ThreadPool::ThreadPool(std::size_t threadCount, bool completeOnDestruction)
 //--------------------------------------------------------------------
 ThreadPool::~ThreadPool()
 {
+    // In zero-thread (“sync”) mode every task has already run inline,
+    // so there is nothing to flush, wake-up, or join.
+    if (syncMode_)
+        return;
     shutdown();
 }
 
