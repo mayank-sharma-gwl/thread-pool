@@ -123,51 +123,206 @@ public:
 
     // Overload for any container (void return type)
     template <typename Container, typename Func>
-    typename std::enable_if<std::is_void<typename std::result_of<Func(typename Container::value_type&)>::type>::value, void>::type
-    parallelFor(Container& container, Func&& func, std::size_t minChunkSize = 1) 
+    typename std::enable_if<std::is_void<typename std::result_of<Func(typename Container::value_type &)>::type>::value, void>::type
+    parallelFor(Container &container, Func &&func, std::size_t minChunkSize = 1)
     {
         if (container.empty())
             return;
-            
+
         // Create a vector of iterators for random access
         std::vector<typename Container::iterator> iterators;
         iterators.reserve(std::distance(container.begin(), container.end()));
-        
-        for (auto it = container.begin(); it != container.end(); ++it) {
+
+        for (auto it = container.begin(); it != container.end(); ++it)
+        {
             iterators.push_back(it);
         }
-        
+
         // Use the existing parallelFor with the iterator vector
-        parallelFor(static_cast<size_t>(0), iterators.size(), 
-            [&iterators, func = std::forward<Func>(func)](size_t i) {
-                func(*(iterators[i]));
-            }, minChunkSize);
+        parallelFor(static_cast<size_t>(0), iterators.size(), [&iterators, func = std::forward<Func>(func)](size_t i)
+                    { func(*(iterators[i])); }, minChunkSize);
     }
 
     // Overload for any container (with return values)
     template <typename Container, typename Func>
-    typename std::enable_if<!std::is_void<typename std::result_of<Func(typename Container::value_type&)>::type>::value, 
-                            std::vector<typename std::result_of<Func(typename Container::value_type&)>::type>>::type
-    parallelFor(Container& container, Func&& func, std::size_t minChunkSize = 1)
+    typename std::enable_if<!std::is_void<typename std::result_of<Func(typename Container::value_type &)>::type>::value,
+                            std::vector<typename std::result_of<Func(typename Container::value_type &)>::type>>::type
+    parallelFor(Container &container, Func &&func, std::size_t minChunkSize = 1)
     {
         if (container.empty())
             return {};
-            
-        using ResultType = typename std::result_of<Func(typename Container::value_type&)>::type;
-        
+
+        using ResultType = typename std::result_of<Func(typename Container::value_type &)>::type;
+
         // Create a vector of iterators for random access
         std::vector<typename Container::iterator> iterators;
         iterators.reserve(std::distance(container.begin(), container.end()));
-        
-        for (auto it = container.begin(); it != container.end(); ++it) {
+
+        for (auto it = container.begin(); it != container.end(); ++it)
+        {
             iterators.push_back(it);
         }
-        
+
         // Use the existing parallelFor with the iterator vector
-        return parallelFor(static_cast<size_t>(0), iterators.size(), 
-            [&iterators, func = std::forward<Func>(func)](size_t i) -> ResultType {
-                return func(*(iterators[i]));
-            }, minChunkSize);
+        return parallelFor(static_cast<size_t>(0), iterators.size(), [&iterators, func = std::forward<Func>(func)](size_t i) -> ResultType
+                           { return func(*(iterators[i])); }, minChunkSize);
+    }
+
+    // Index-based, void-return
+    template <typename Func>
+    auto parallelForOrdered(std::size_t first, std::size_t last, Func &&func, std::size_t chunkSize = 1)
+        -> typename std::enable_if<
+            std::is_void<typename std::result_of<Func(std::size_t)>::type>::value,
+            void>::type
+    {
+        if (first >= last)
+            return;
+        if (chunkSize == 0)
+            chunkSize = 1;
+
+        auto totalChunks = (last - first + chunkSize - 1) / chunkSize;
+        std::vector<std::future<void>> futures;
+        futures.reserve(totalChunks);
+
+        // launch all chunks
+        for (std::size_t chunkStart = first; chunkStart < last; chunkStart += chunkSize)
+        {
+            std::size_t chunkEnd = std::min(chunkStart + chunkSize, last);
+            // capture func by move, chunkStart, chunkEnd by value
+            futures.emplace_back(
+                enqueue([func = std::forward<Func>(func), chunkStart, chunkEnd]() mutable
+                        {
+                     for (std::size_t i = chunkStart; i < chunkEnd; ++i) {
+                         func(i);
+                     } }));
+        }
+
+        // collect in order
+        for (auto &fut : futures)
+            fut.get();
+    }
+
+    // Index-based, non-void return
+    template <typename Func>
+    auto parallelForOrdered(std::size_t first, std::size_t last, Func &&func, std::size_t chunkSize = 1)
+        -> typename std::enable_if<
+            !std::is_void<typename std::result_of<Func(std::size_t)>::type>::value,
+            std::vector<typename std::result_of<Func(std::size_t)>::type>>::type
+    {
+        using ResultType = typename std::result_of<Func(std::size_t)>::type;
+        if (first >= last)
+            return {};
+        if (chunkSize == 0)
+            chunkSize = 1;
+
+        auto totalChunks = (last - first + chunkSize - 1) / chunkSize;
+        std::vector<std::future<std::vector<ResultType>>> futures;
+        futures.reserve(totalChunks);
+
+        // launch
+        for (std::size_t chunkStart = first; chunkStart < last; chunkStart += chunkSize)
+        {
+            std::size_t chunkEnd = std::min(chunkStart + chunkSize, last);
+            futures.emplace_back(
+                enqueue([func = std::forward<Func>(func), chunkStart, chunkEnd]() mutable
+                        {
+                     std::vector<ResultType> local;
+                     local.reserve(chunkEnd - chunkStart);
+                     for (std::size_t i = chunkStart; i < chunkEnd; ++i)
+                         local.push_back(func(i));
+                     return local; }));
+        }
+
+        // collect ordered
+        std::vector<ResultType> result;
+        result.reserve(last - first);
+        for (auto &fut : futures)
+        {
+            auto chunk = fut.get();
+            std::move(chunk.begin(), chunk.end(), std::back_inserter(result));
+        }
+        return result;
+    }
+
+    // Container-based, void-return
+    // —————————————————————————————————————————————————————
+    // We want parallel compute *and* strict ordering of the side-effects.
+    // Phase 1 (parallel): we do *nothing* but spin up N no-op tasks
+    //  (we only need them to synchronize on chunk boundaries)
+    // Phase 2 (serial): we invoke your side-effecting func() in exact order.
+    template <typename Container, typename Func>
+    typename std::enable_if<
+        std::is_void<typename std::result_of<Func(typename Container::value_type &)>::type>::value>::type
+    parallelForOrdered(Container &c, Func &&func, std::size_t chunkSize)
+    {
+        if (c.empty())
+            return;
+        if (chunkSize == 0)
+            chunkSize = 1;
+
+        const size_t total = c.size();
+        const size_t nChunks = (total + chunkSize - 1) / chunkSize;
+
+        // 1) launch one dummy task per chunk (just to occupy the workers)
+        std::vector<std::future<void>> syncs;
+        syncs.reserve(nChunks);
+        for (size_t chunkId = 0; chunkId < nChunks; ++chunkId)
+        {
+            syncs.emplace_back(
+                enqueue([=]() { /* no-op; just sync */ }));
+        }
+        for (auto &f : syncs)
+            f.get();
+
+        // 2) single-threaded, strict order: call func(c[i]) for every i
+        for (size_t i = 0; i < total; ++i)
+        {
+            func(c[i]);
+        }
+    }
+
+    // Container-based, non-void return
+    // —————————————————————————————————————————————————————
+    // We pre-allocate the full result vector once, then each chunk
+    // writes its own slice in parallel—no extra buffers needed.
+    template <typename Container, typename Func>
+    typename std::enable_if<
+        !std::is_void<typename std::result_of<Func(typename Container::value_type &)>::type>::value,
+        std::vector<typename std::result_of<Func(typename Container::value_type &)>::type>>::type
+    parallelForOrdered(Container &c, Func &&func, std::size_t chunkSize)
+    {
+        if (c.empty())
+            return {};
+        if (chunkSize == 0)
+            chunkSize = 1;
+
+        using ResultType = typename std::result_of<Func(typename Container::value_type &)>::type;
+        const size_t total = c.size();
+        const size_t nChunks = (total + chunkSize - 1) / chunkSize;
+
+        // Pre-allocate one flat result array
+        std::vector<ResultType> result(total);
+
+        // Launch each chunk in parallel: write directly into result[]
+        std::vector<std::future<void>> futures;
+        futures.reserve(nChunks);
+
+        for (size_t chunkId = 0; chunkId < nChunks; ++chunkId)
+        {
+            size_t start = chunkId * chunkSize;
+            size_t end = std::min(start + chunkSize, total);
+
+            futures.emplace_back(
+                enqueue([&, start, end]()
+                        {
+                for (size_t i = start; i < end; ++i) {
+                    result[i] = func(c[i]);
+                } }));
+        }
+        for (auto &f : futures)
+            f.get();
+
+        return result;
     }
 
     // legacy API wrapper returning MultiFuture for convenience

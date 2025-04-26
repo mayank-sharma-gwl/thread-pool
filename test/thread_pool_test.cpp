@@ -12,6 +12,8 @@
 #include <array>
 #include <mutex>
 #include <algorithm>
+#include <random>
+#include <map>
 
 using namespace std::chrono_literals; // for using 100ms, etc.
 
@@ -46,6 +48,36 @@ protected:
     };
 
     SharedData sharedData;
+};
+
+
+class ParallelForBenchmarks : public ::testing::Test {
+    protected:
+        ThreadPool* pool;
+    
+        void SetUp() override {
+            pool = new ThreadPool(std::thread::hardware_concurrency());
+        }
+    
+        void TearDown() override {
+            pool->waitForCompletion();
+            delete pool;
+        }
+};
+
+
+class ParallelForOrderedTests : public ::testing::Test {
+protected:
+    ThreadPool* pool;
+
+    void SetUp() override {
+        pool = new ThreadPool(4);  // 4 threads
+    }
+
+    void TearDown() override {
+        pool->waitForCompletion();
+        delete pool;
+    }
 };
 
 TEST_F(ThreadPoolTest, EnqueueSingleTaskReturnsCorrectValue)
@@ -1646,7 +1678,7 @@ TEST_F(ThreadPoolTest, StressTest)
 
 //         auto start = std::chrono::high_resolution_clock::now();
 
-//         pool->parallelFor(0, ARRAY_SIZE, [&parallel_results, &compute_fn](int i)
+//         pool->parallelFor(size_t{0}, ARRAY_SIZE, [&parallel_results, &compute_fn](int i)
 //                           { parallel_results[i] = compute_fn(i); }, chunk_size);
 
 //         auto end = std::chrono::high_resolution_clock::now();
@@ -1984,5 +2016,642 @@ TEST_F(ThreadPoolTest, ParallelForWorkloadPerformance2)
             EXPECT_GT(best_result.speedup, 1.1)
                 << "Expected significant speedup for CPU-bound workload";
         }
+    }
+}
+
+/*
+    Benchmark single-thread vs multi-thread summation.
+    Fill 10 million integers with random values.
+    Compare timings and output speedup.
+    Verify correctness by comparing final sums.
+*/
+TEST_F(ParallelForBenchmarks, HugeVectorSummationBenchmark) {
+    constexpr size_t vectorSize = 10'000'000;
+    std::vector<int> data(vectorSize);
+
+    // Fill with random numbers
+    std::mt19937                       rng(42);
+    std::uniform_int_distribution<int> dist(1, 100);
+    for (auto &v : data) v = dist(rng);
+
+    // ---- Single-threaded Summation ----
+    auto start_single = std::chrono::high_resolution_clock::now();
+    long long sum_single = std::accumulate(data.begin(), data.end(), 0LL);
+    auto end_single  = std::chrono::high_resolution_clock::now();
+    auto time_single = std::chrono::duration_cast<std::chrono::milliseconds>(end_single - start_single).count();
+    std::cout << "[Single-threaded sum = " << sum_single << "] took " << time_single << " ms\n";
+
+    // ---- Multi-threaded Summation (one task per thread) ----
+    size_t numThreads = pool->getThreadCount();
+    size_t chunkSize  = (vectorSize + numThreads - 1) / numThreads;
+    printf("Using %zu threads, chunk size: %zu\n", numThreads, chunkSize);
+    // Start the timer
+    // Note: We use high_resolution_clock for better precision
+    // but the actual resolution may vary based on the system
+    // and the workload.
+    // This is just a demonstration; in real-world scenarios,
+    // you might want to use steady_clock or system_clock
+    // depending on your needs.
+    // For benchmarking, high_resolution_clock is often preferred
+    // for its precision.
+    // However, be cautious about the clock's resolution    
+
+    auto start_multi = std::chrono::high_resolution_clock::now();
+
+    // 1) launch one task per chunk
+    std::vector<std::future<long long>> futures;
+    futures.reserve(numThreads);
+    for (size_t offset = 0; offset < vectorSize; offset += chunkSize) {
+        size_t begin = offset;
+        size_t end   = std::min(offset + chunkSize, vectorSize);
+        futures.emplace_back(
+            pool->enqueue([&, begin, end]() {
+                long long local = 0;
+                for (size_t i = begin; i < end; ++i)
+                    local += data[i];
+                return local;
+            })
+        );
+    }
+
+    // 2) gather the partial sums
+    long long sum_multi = 0;
+    for (auto &f : futures)
+        sum_multi += f.get();
+
+    auto end_multi  = std::chrono::high_resolution_clock::now();
+    auto time_multi = std::chrono::duration_cast<std::chrono::milliseconds>(end_multi - start_multi).count();
+    std::cout << "[Multi-threaded sum = " << sum_multi << "] took " << time_multi << " ms\n";
+
+    // ---- Verification ----
+    ASSERT_EQ(sum_single, sum_multi);
+
+    if (time_multi < time_single) {
+        float speedup = float(time_single) / float(time_multi);
+        std::cout << "✅ Speedup: " << speedup << "x\n";
+    } else {
+        std::cout << "⚠️ No speedup detected (overhead or CPU limits).\n";
+    }
+}
+
+/*
+    Launch 50,000 tiny tasks (each just increments a counter).
+    Measures how fast the thread pool handles a lot of overhead (tiny task = more scheduling stress).
+    Asserts that no task is lost.
+*/
+
+TEST_F(ParallelForBenchmarks, HeavyContentionStressTest) {
+    constexpr size_t tinyTasks = 50000;
+    std::atomic<size_t> counter{0};
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < tinyTasks; ++i) {
+        pool->enqueue([&counter]() {
+            counter.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+
+    pool->waitForCompletion();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    std::cout << "[Heavy Contention Test] Completed " << counter.load() << " tiny tasks in " 
+              << durationMs << " ms\n";
+
+    EXPECT_EQ(counter.load(), tinyTasks);
+}
+
+// Custom struct for this test
+struct MyData {
+    int a;
+    int b;
+    int c;
+
+    MyData(int x = 0) : a(x), b(x+1), c(x+2) {}
+};
+/*
+    Defines a custom struct MyData.
+    Initializes a large vector<MyData>.
+    Applies parallel transformation (a += 10, b *= 2, c -= 5).
+    Verifies correctness after modification.
+    Demonstrates that your parallelFor() works on user-defined types!
+*/
+TEST_F(ParallelForBenchmarks, ParallelFor_CustomStructProcessing) {
+    constexpr size_t elementCount = 10000;
+
+    // Initialize each element with its index so a=i, b=i+1, c=i+2
+    std::vector<MyData> data;
+    data.reserve(elementCount);
+    for (int i = 0; i < static_cast<int>(elementCount); ++i) {
+        data.emplace_back(i);
+    }
+
+    // Perform parallel modification
+    pool->parallelFor(data, [](MyData& item) {
+        item.a += 10;
+        item.b *= 2;
+        item.c -= 5;
+    });
+
+    // Check correctness
+    for (size_t i = 0; i < data.size(); ++i) {
+        EXPECT_EQ(data[i].a, static_cast<int>(i) + 10);
+        EXPECT_EQ(data[i].b, (static_cast<int>(i) + 1) * 2);
+        EXPECT_EQ(data[i].c, (static_cast<int>(i) + 2) - 5);
+    }
+
+    std::cout << "[ParallelFor on MyData Struct] Successfully verified " << elementCount << " elements\n";
+}
+
+/*
+    Compares Single-threaded vs Multi-threaded matrix multiply.
+    Uses parallelFor(start, end, func) for row-wise splitting.
+    Confirms results match exactly!
+    Prints time and speedup.
+    Heavy real-world test (matches your simulator style apps).
+*/
+
+TEST_F(ParallelForBenchmarks, MatrixMultiplicationBenchmark) {
+    constexpr int N = 300; // Matrix dimension (NxN)
+    std::vector<std::vector<int>> A(N, std::vector<int>(N, 2));
+    std::vector<std::vector<int>> B(N, std::vector<int>(N, 3));
+    std::vector<std::vector<int>> D(N, std::vector<int>(N, 0)); // Result matrix
+
+    // ---- Single-threaded Matrix Multiply ----
+    auto start_single = std::chrono::high_resolution_clock::now();
+    {
+        for (int i = 0; i < N; ++i) {
+            for (int j = 0; j < N; ++j) {
+                int sum = 0;
+                for (int k = 0; k < N; ++k) {
+                    sum += A[i][k] * B[k][j];
+                }
+                D[i][j] = sum;
+            }
+        }
+    }
+    auto end_single = std::chrono::high_resolution_clock::now();
+    auto time_single = std::chrono::duration_cast<std::chrono::milliseconds>(end_single - start_single).count();
+
+    std::cout << "[Single-threaded matrix multiplication took " << time_single << " ms]\n";
+
+    // Store single-threaded result
+    auto D_single = D;
+
+    // ---- Multi-threaded Matrix Multiply using parallelFor ----
+    // Reset D
+    for (auto& row : D) {
+        std::fill(row.begin(), row.end(), 0);
+    }
+
+    auto start_multi = std::chrono::high_resolution_clock::now();
+    {
+        pool->parallelFor(0, N, [&](int i) {
+            for (int j = 0; j < N; ++j) {
+                int sum = 0;
+                for (int k = 0; k < N; ++k) {
+                    sum += A[i][k] * B[k][j];
+                }
+                D[i][j] = sum;
+            }
+        });
+        pool->waitForCompletion(); // Important: wait before measuring time
+    }
+    auto end_multi = std::chrono::high_resolution_clock::now();
+    auto time_multi = std::chrono::duration_cast<std::chrono::milliseconds>(end_multi - start_multi).count();
+
+    std::cout << "[Multi-threaded matrix multiplication took " << time_multi << " ms]\n";
+
+    // ---- Verify matrices are equal ----
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            EXPECT_EQ(D[i][j], D_single[i][j]);
+        }
+    }
+
+    if (time_multi < time_single) {
+        float speedup = static_cast<float>(time_single) / time_multi;
+        std::cout << "✅ Speedup: " << speedup << "x\n";
+    } else {
+        std::cout << "⚠️ No speedup detected (likely small size or CPU load)\n";
+    }
+}
+
+/*
+    Launch many readers first (50 concurrent readers).
+    Launch some writers next (10 concurrent writers).
+    Readers can happen in parallel, writers are exclusive.
+    Validates final data state after modifications.
+    Stress test for your pool's enqueueThreadSafeRead/Write()!
+*/
+
+TEST_F(ReaderWriterTests, ParallelSafeReadsAndWrites) {
+    constexpr int numReaders = 50;
+    constexpr int numWriters = 10;
+
+    // 1. Launch many concurrent readers
+    for (int i = 0; i < numReaders; ++i) {
+        pool->enqueueThreadSafeRead(sharedData, [](const SharedData& data) {
+            EXPECT_GE(data.data.size(), 5);
+        });
+    }
+
+    // 2. Launch some writers that modify data
+    for (int i = 0; i < numWriters; ++i) {
+        pool->enqueueThreadSafeWrite(sharedData, [](SharedData& data) {
+            data.data.push_back(42);
+        });
+    }
+
+    pool->waitForCompletion();
+
+    // 3. Validate
+    std::cout << "[ReaderWriter Safe Test] Readers launched: " << numReaders 
+              << ", Writers launched: " << numWriters << "\n";
+    EXPECT_GE(sharedData.data.size(), 5 + numWriters);  // Writers add 1 element each
+}
+
+/*
+    Launches asynchronous chunks (non-blocking parallelForAsync).
+    Only waits later using futures (fut.get()).
+    Validates all elements modified properly.
+    Confirms your thread pool can handle async dispatch safely!
+*/
+
+TEST_F(ParallelForBenchmarks, ParallelForAsyncTest) {
+    constexpr int totalElements = 10000;
+    std::vector<int> data(totalElements, 1);  // all ones
+
+    // fire off the async parallel-for
+    MultiFuture<void> mf = pool->parallelForAsync(
+        0, totalElements,
+        [&data](int i) {
+            data[i] *= 2;
+        },
+        100    // chunk size
+    );
+
+    // wait for _all_ chunks to finish
+    mf.get();    // or mf.wait();
+
+    // verify
+    for (int i = 0; i < totalElements; ++i) {
+        EXPECT_EQ(data[i], 2) << "at index " << i;
+    }
+
+    std::cout << "[ParallelForAsync Test] Successfully doubled "
+              << totalElements << " elements asynchronously.\n";
+}
+
+
+/*
+    In index-based parallelFor(start, end, func), you can validate final array matches index order.
+    In container-based parallelFor(container, func), you can validate that no elements are left invalid, but not assume specific value patterns unless you enforce stricter locking.
+*/
+TEST_F(ParallelForBenchmarks, ParallelFor_ContainerOrderCorrectness) {
+    constexpr size_t numElements = 5000;
+    // 1) Fill with a sentinel that your worker should never write.
+    std::vector<int> data(numElements, -1);
+
+    // 2) Shared counter so every thread writes a unique >=0 value.
+    static std::atomic<int> offset{0};
+    pool->parallelFor(data, [&](int &val) {
+        val = offset.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    pool->waitForCompletion();
+
+    // 3) Verify every slot was overwritten (no -1s remain).
+    for (size_t i = 0; i < numElements; ++i) {
+        EXPECT_NE(data[i], -1) << "data[" << i << "] was never written";
+    }
+
+    std::cout << "[ParallelFor Container Write Test] All elements were written.\n";
+}
+
+TEST_F(ParallelForBenchmarks, ParallelForOrdered_ContainerOrderCorrectness) {
+        constexpr size_t numElements = 5000;
+        // each element starts out equal to its index
+        std::vector<int> data(numElements);
+        std::iota(data.begin(), data.end(), 0);
+    
+        // collect in order
+        std::vector<int> output;
+        output.reserve(numElements);
+        std::mutex m;
+    
+        pool->parallelForOrdered(data, [&](int& val) {
+            std::lock_guard<std::mutex> lk(m);
+            output.push_back(val);
+        }, /*chunkSize=*/100);
+        pool->waitForCompletion();
+    
+        // must have exactly [0,1,2,...]
+        ASSERT_EQ(output.size(), numElements);
+        for (size_t i = 0; i < numElements; ++i) {
+            EXPECT_EQ(output[i], static_cast<int>(i));
+        }
+    
+        std::cout << "[parallelForOrdered Container Order Test] Verified strict order for "
+                  << numElements << " elements\n";
+    }
+
+// ----------
+// 1. Range-based, void-return
+TEST_F(ParallelForOrderedTests, RangeVoidMaintainsOrder) {
+    constexpr size_t numElements = 1000;
+    std::vector<int> output(numElements, -1);
+    std::mutex outputMutex;
+
+    pool->parallelForOrdered(0, numElements, [&](size_t i) {
+        std::lock_guard<std::mutex> lock(outputMutex);
+        output[i] = static_cast<int>(i);
+    }, 50); // chunk size 50
+
+    pool->waitForCompletion();
+
+    ASSERT_EQ(output.size(), numElements);
+    for (size_t i = 0; i < numElements; ++i) {
+        EXPECT_EQ(output[i], static_cast<int>(i));
+    }
+}
+
+// ----------
+// 2. Range-based, return-value
+TEST_F(ParallelForOrderedTests, RangeReturnValueMaintainsOrder) {
+    constexpr size_t numElements = 1000;
+
+    auto results = pool->parallelForOrdered(0, numElements, [](size_t i) {
+        return static_cast<int>(i * i);
+    }, 100); // chunk size 100
+
+    pool->waitForCompletion();
+
+    ASSERT_EQ(results.size(), numElements);
+    for (size_t i = 0; i < numElements; ++i) {
+        EXPECT_EQ(results[i], static_cast<int>(i * i));
+    }
+}
+
+// ----------
+// 3. Container-based, void-return
+TEST_F(ParallelForOrderedTests, ContainerVoidMaintainsOrder) {
+    std::vector<int> data(1000);
+    std::iota(data.begin(), data.end(), 0); // 0,1,2,...
+
+    std::vector<int> output(data.size(), -1);
+    std::mutex outputMutex;
+
+    pool->parallelForOrdered(data, [&](int& val) {
+        std::lock_guard<std::mutex> lock(outputMutex);
+        output[val] = val;
+    }, 75);
+
+    pool->waitForCompletion();
+
+    ASSERT_EQ(output.size(), data.size());
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_EQ(output[i], static_cast<int>(i));
+    }
+}
+
+// ----------
+// 4. Container-based, return-value
+TEST_F(ParallelForOrderedTests, ContainerReturnValueMaintainsOrder) {
+    std::vector<int> data(500);
+    std::iota(data.begin(), data.end(), 0); // 0,1,2,...
+
+    auto results = pool->parallelForOrdered(data, [](int& val) {
+        return val * 3;
+    }, 50);
+
+    pool->waitForCompletion();
+
+    ASSERT_EQ(results.size(), data.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_EQ(results[i], static_cast<int>(i * 3));
+    }
+}
+
+TEST_F(ParallelForOrderedTests, HugeVectorPerformanceComparison) {
+    constexpr size_t numElements = 10'000'000;
+
+    // Prepare data
+    std::vector<int> bigData(numElements);
+    std::iota(bigData.begin(), bigData.end(), 1); // [1, 2, …]
+
+    // --- Single‐threaded baseline ---
+    std::vector<int> resultSingle(numElements);
+    auto start_single = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < numElements; ++i) {
+        resultSingle[i] = bigData[i] * 2;
+    }
+    auto end_single = std::chrono::high_resolution_clock::now();
+    auto time_single = std::chrono::duration_cast<std::chrono::milliseconds>(end_single - start_single).count();
+
+    // --- Multi‐threaded using index‐based parallelForOrdered ---
+    std::vector<int> resultParallel(numElements);
+    auto start_parallel = std::chrono::high_resolution_clock::now();
+    // <— here we call the std::size_t‐indexed overload, not the void‐container one
+    pool->parallelForOrdered(
+        /* first     */ 0,
+        /* last      */ numElements,
+        /* chunk func */ [&](size_t i) {
+            resultParallel[i] = bigData[i] * 2;
+        },
+        /*chunkSize  */ 10000
+    );
+    pool->waitForCompletion();  // wait for all chunk‐tasks
+    auto end_parallel = std::chrono::high_resolution_clock::now();
+    auto time_parallel = std::chrono::duration_cast<std::chrono::milliseconds>(end_parallel - start_parallel).count();
+
+    // --- Verify correctness ---
+    ASSERT_EQ(resultSingle, resultParallel);
+
+    // --- Report timings ---
+    std::cout << "\n===== Huge Vector (10M) Performance =====\n";
+    std::cout << "Single-threaded time:       " << time_single   << " ms\n";
+    std::cout << "Index-based parallel time:  " << time_parallel << " ms\n";
+
+    // Now you should see a real speedup if the hardware allows it:
+    if (time_parallel < time_single) {
+        float speedup = float(time_single) / float(time_parallel);
+        std::cout << "✅ Speedup: " << speedup << "x\n";
+    } else {
+        std::cout << "⚠️ No speedup (CPU/core count, overheads, etc.)\n";
+    }
+}
+
+
+TEST_F(ParallelForOrderedTests, ThreeWayPerformanceComparison) {
+    constexpr size_t numElements = 10'000'000;
+    std::vector<int> bigData(numElements);
+    std::iota(bigData.begin(), bigData.end(), 1); // [1,2,...]
+
+    std::vector<int> resultSingle(numElements, 0);
+    std::vector<int> resultParallel(numElements, 0);
+    std::vector<int> resultParallelOrdered(numElements, 0);
+
+    // --- Single-threaded baseline ---
+    auto start_single = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < bigData.size(); ++i) {
+        resultSingle[i] = bigData[i] * 2;
+    }
+    auto end_single = std::chrono::high_resolution_clock::now();
+    auto time_single = std::chrono::duration_cast<std::chrono::milliseconds>(end_single - start_single).count();
+
+    // --- parallelFor (unordered) ---
+    auto start_parallel = std::chrono::high_resolution_clock::now();
+    pool->parallelFor(bigData, [&](int& val) {
+        resultParallel[val - 1] = val * 2;
+    }, 10000);
+    pool->waitForCompletion();
+    auto end_parallel = std::chrono::high_resolution_clock::now();
+    auto time_parallel = std::chrono::duration_cast<std::chrono::milliseconds>(end_parallel - start_parallel).count();
+
+    // --- parallelForOrdered (ordered) ---
+    auto start_ordered = std::chrono::high_resolution_clock::now();
+    pool->parallelForOrdered(bigData, [&](int& val) {
+        resultParallelOrdered[val - 1] = val * 2;
+    }, 10000);
+    pool->waitForCompletion();
+    auto end_ordered = std::chrono::high_resolution_clock::now();
+    auto time_ordered = std::chrono::duration_cast<std::chrono::milliseconds>(end_ordered - start_ordered).count();
+
+    // --- Validate correctness ---
+    ASSERT_EQ(resultSingle, resultParallel);
+    ASSERT_EQ(resultSingle, resultParallelOrdered);
+
+    // --- Print Results ---
+    std::cout << "\n===== 3-Way Performance Comparison =====\n";
+    std::cout << "Single-threaded time:    " << time_single << " ms\n";
+    std::cout << "Parallel (unordered) time: " << time_parallel << " ms\n";
+    std::cout << "Parallel (ordered) time:   " << time_ordered << " ms\n";
+
+    if (time_parallel < time_single) {
+        float speedup = static_cast<float>(time_single) / time_parallel;
+        std::cout << "Unordered parallel speedup: " << speedup << "x\n";
+    }
+    if (time_ordered < time_single) {
+        float speedup = static_cast<float>(time_single) / time_ordered;
+        std::cout << "Ordered parallel speedup: " << speedup << "x\n";
+    }
+}
+
+TEST_F(ThreadPoolTest, LoadBalancingTest) {
+    constexpr int T = 4;
+    ThreadPool pool(T);
+    std::vector<std::atomic<int>> thread_loads(T);
+    
+    // For mapping std::thread::id → [0..T-1]
+    std::mutex id_mutex;
+    std::map<std::thread::id,int> id_map;
+    std::atomic<int> next_id{0};
+
+    for (int i = 0; i < 1000; ++i) {
+        pool.enqueue([&] {
+            // Assign each worker thread a unique small index
+            static thread_local int thread_index = -1;
+            if (thread_index < 0) {
+                std::lock_guard<std::mutex> lock(id_mutex);
+                auto tid = std::this_thread::get_id();
+                auto it  = id_map.find(tid);
+                if (it == id_map.end()) {
+                    // First time we see this thread
+                    thread_index        = next_id++;
+                    id_map[tid]         = thread_index;
+                } else {
+                    thread_index = it->second;
+                }
+            }
+
+            // Count one unit of work for this thread
+            thread_loads[thread_index].fetch_add(1, std::memory_order_relaxed);
+
+            // Simulate some work
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        });
+    }
+
+    pool.waitForCompletion();
+
+    // Compute min/max load across the T worker threads
+    int min_load = std::numeric_limits<int>::max();
+    int max_load = 0;
+    for (int i = 0; i < T; ++i) {
+        int l = thread_loads[i].load();
+        min_load = std::min(min_load, l);
+        max_load = std::max(max_load, l);
+        std::cout << "Thread[" << i << "] did " << l << " tasks\n";
+    }
+
+    // We expect the difference to be reasonably small
+    EXPECT_LT(max_load - min_load, 100);
+}
+
+TEST_F(ThreadPoolTest, ThreadPoolStateTransitions) {
+    ThreadPool pool(4);
+    
+    // Test various state transitions
+    EXPECT_NO_THROW({
+        pool.pause();
+        pool.pause();  // Double pause
+        pool.resume();
+        pool.resume(); // Double resume
+        pool.shutdown();
+        pool.shutdown(); // Double shutdown
+    });
+}
+
+TEST_F(ThreadPoolTest, TaskCancellationBehavior) {
+    ThreadPool pool(4);
+    std::atomic<bool> task_ran{false};
+
+    auto future = pool.enqueue([&task_ran]{
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        task_ran = true;
+    });
+
+    // Test cancellation or shutdown behavior
+    pool.shutdown();
+    EXPECT_TRUE(task_ran);  // Task should complete despite shutdown
+}
+
+TEST_F(ThreadPoolTest, ThreadSafetyWithExceptions) {
+    ThreadPool pool(4);
+    std::atomic<int> exception_count{0};
+    std::atomic<int> success_count{0};
+
+    for(int i = 0; i < 100; i++) {
+        pool.enqueue([i, &exception_count, &success_count]{
+            if(i % 3 == 0) {
+                exception_count++;
+                throw std::runtime_error("Planned error");
+            }
+            success_count++;
+        });
+    }
+
+    pool.waitForCompletion();
+    EXPECT_EQ(exception_count, 34);  // 100/3 rounded up
+    EXPECT_EQ(success_count, 66);    // remaining tasks
+}
+
+TEST_F(ThreadPoolTest, ResourceExhaustionTest) {
+    ThreadPool pool(4);
+    std::vector<std::future<void>> futures;
+    
+    // Submit many large tasks to test memory handling
+    for(int i = 0; i < 1000; i++) {
+        futures.push_back(pool.enqueue([]{
+            std::vector<int> large(1000000, 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }));
+    }
+    
+    for(auto& fut : futures) {
+        EXPECT_NO_THROW(fut.get());
     }
 }

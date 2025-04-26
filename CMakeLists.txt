@@ -111,8 +111,8 @@ target_link_libraries(thread_pool_test
     $<$<NOT:$<BOOL:${BOOST_LIBRARY_THREAD}>>:Boost::thread>
 )
 
-# Register test
-add_test(NAME thread_pool_tests COMMAND thread_pool_test)
+# # Register test
+# add_test(NAME thread_pool_tests COMMAND thread_pool_test)
 
 # Enable test discovery
 set_target_properties(thread_pool_test PROPERTIES
