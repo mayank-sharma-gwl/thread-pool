@@ -2453,6 +2453,8 @@ TEST_F(ParallelForOrderedTests, HugeVectorPerformanceComparison) {
 
     // --- Multi‐threaded using index‐based parallelForOrdered ---
     std::vector<int> resultParallel(numElements);
+    size_t chunk = pool->idealChunkSize(numElements, pool->getThreadCount(), /*F=*/4);
+    std::cout << "Using chunk size: " << chunk << "\n";
     auto start_parallel = std::chrono::high_resolution_clock::now();
     // <— here we call the std::size_t‐indexed overload, not the void‐container one
     pool->parallelForOrdered(
@@ -2461,7 +2463,7 @@ TEST_F(ParallelForOrderedTests, HugeVectorPerformanceComparison) {
         /* chunk func */ [&](size_t i) {
             resultParallel[i] = bigData[i] * 2;
         },
-        /*chunkSize  */ 10000
+        /*chunkSize  */ chunk
     );
     pool->waitForCompletion();  // wait for all chunk‐tasks
     auto end_parallel = std::chrono::high_resolution_clock::now();

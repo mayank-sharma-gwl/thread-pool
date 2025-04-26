@@ -440,6 +440,9 @@ public:
     void resume();
     void waitForCompletion();
     void shutdown();
+    
+    //chunkSize calculator
+    size_t idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe);
 
     // debug helper
     void printStatus() const;

@@ -190,3 +190,13 @@ void ThreadPool::printStatus() const
               << "  Accepting: " << (acceptingTasks_ ? "yes" : "no")
               << "  Paused: " << (paused_ ? "yes" : "no") << std::endl;
 }
+
+size_t ThreadPool::idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe = 4) {
+    size_t totalChunks = numThreads * oversubscribe;
+    if (totalChunks == 0) totalChunks = 1;
+    return (N + totalChunks - 1) / totalChunks;
+}
+
+// …later…
+// size_t chunk = idealChunkSize(numElements, pool->getThreadCount(), /*F=*/4);
+// pool->parallelForOrdered(0, numElements, yourFunc, chunk);

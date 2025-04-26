@@ -4,6 +4,9 @@ project(thread_pool)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG -march=native -flto -funroll-loops -Wall -Wextra")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -march=native -flto -funroll-loops -Wall -Wextra")
+
 # Set default package locations (customize these paths as needed)
 # These can be overridden by providing -DBOOST_ROOT or -DGTEST_ROOT when invoking CMake.
 if(NOT DEFINED BOOST_ROOT)
