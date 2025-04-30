@@ -499,6 +499,137 @@ private:
             std::forward<Tuple>(tuple),
             std::make_index_sequence<std::tuple_size<typename std::decay<Tuple>::type>::value>{});
     }
+
+// New functions to make it thread safe calls
+private:
+    // threadSafeExecWithMutex (non-void)
+    template<typename Func, typename... Args,
+             typename Ret = typename std::result_of<Func(Args...)>::type,
+             typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
+    static Ret threadSafeExecWithMutex(std::mutex& m, Func&& fn, Args&&... as) {
+        std::lock_guard<std::mutex> lock(m);
+        return fn(std::forward<Args>(as)...);
+    }
+    // threadSafeExecWithMutex (void)
+    template<typename Func, typename... Args,
+             typename Ret = typename std::result_of<Func(Args...)>::type,
+             typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
+    static void threadSafeExecWithMutex(std::mutex& m, Func&& fn, Args&&... as) {
+        std::lock_guard<std::mutex> lock(m);
+        fn(std::forward<Args>(as)...);
+    }
+
+public:
+    // global-mutex wrapper
+    template<typename Func, typename... Args>
+    auto threadSafeExec(Func&& fn, Args&&... as)
+      -> typename std::result_of<Func(Args...)>::type
+    {
+        static std::mutex global_mutex;
+        return threadSafeExecWithMutex(global_mutex,
+                                       std::forward<Func>(fn),
+                                       std::forward<Args>(as)...);
+    }
+
+    // ----------------------------------------------------------------
+    // threadSafeRead / threadSafeWrite (shared_mutex, C++14)
+    // ----------------------------------------------------------------
+    template<typename Mutex, typename Func, typename... Args>
+    auto threadSafeExec(Mutex& mutex, Func&& fn, Args&&... as)
+      -> typename std::result_of<Func(Args...)>::type
+    {
+        return threadSafeExecWithMutex(mutex,
+                                       std::forward<Func>(fn),
+                                       std::forward<Args>(as)...);
+    }
+private:
+    // read (non-void)
+    template<typename RWMutex, typename Func, typename... Args,
+             typename Ret = typename std::result_of<Func(Args...)>::type,
+             typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
+    static Ret threadSafeReadWithMutex(RWMutex& m, Func&& fn, Args&&... as) {
+        std::shared_lock<RWMutex> lock(m);
+        return fn(std::forward<Args>(as)...);
+    }
+    // read (void)
+    template<typename RWMutex, typename Func, typename... Args,
+             typename Ret = typename std::result_of<Func(Args...)>::type,
+             typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
+    static void threadSafeReadWithMutex(RWMutex& m, Func&& fn, Args&&... as) {
+        std::shared_lock<RWMutex> lock(m);
+        fn(std::forward<Args>(as)...);
+    }
+    // write (non-void)
+    template<typename RWMutex, typename Func, typename... Args,
+             typename Ret = typename std::result_of<Func(Args...)>::type,
+             typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
+    static Ret threadSafeWriteWithMutex(RWMutex& m, Func&& fn, Args&&... as) {
+        std::unique_lock<RWMutex> lock(m);
+        return fn(std::forward<Args>(as)...);
+    }
+    // write (void)
+    template<typename RWMutex, typename Func, typename... Args,
+             typename Ret = typename std::result_of<Func(Args...)>::type,
+             typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
+    static void threadSafeWriteWithMutex(RWMutex& m, Func&& fn, Args&&... as) {
+        std::unique_lock<RWMutex> lock(m);
+        fn(std::forward<Args>(as)...);
+    }
+
+public:
+    template<typename RWMutex, typename Func, typename... Args>
+    auto threadSafeRead(RWMutex& m, Func&& fn, Args&&... as)
+      -> typename std::result_of<Func(Args...)>::type
+    {
+        return threadSafeReadWithMutex(m,
+                                       std::forward<Func>(fn),
+                                       std::forward<Args>(as)...);
+    }
+
+    template<typename RWMutex, typename Func, typename... Args>
+    auto threadSafeWrite(RWMutex& m, Func&& fn, Args&&... as)
+      -> typename std::result_of<Func(Args...)>::type
+    {
+        return threadSafeWriteWithMutex(m,
+                                        std::forward<Func>(fn),
+                                        std::forward<Args>(as)...);
+    }
+
+    // ----------------------------------------------------------------
+    // striped parallelForThreadSafe – high performance
+    // ----------------------------------------------------------------
+
+private:
+    static constexpr size_t KEY_STRIPES = 256;  // power of two
+    std::array<std::mutex, KEY_STRIPES> keyMutexStripes_;
+
+public:
+    template<typename Index, typename KeyFunc, typename ExecFunc>
+    void parallelForThreadSafe(
+        Index first, Index last,
+        KeyFunc  keyFunc,
+        ExecFunc execFunc,
+        std::size_t chunk = 1
+    ) {
+        static_assert((KEY_STRIPES & (KEY_STRIPES-1))==0,
+                      "KEY_STRIPES must be power of two");
+
+        KeyFunc  keyF  = std::move(keyFunc);
+        ExecFunc execF = std::move(execFunc);
+
+        parallelFor(first, last,
+          [this, keyF = std::move(keyF), execF = std::move(execF)](Index i) {
+            auto k = keyF(i);
+            auto h = std::hash<typename std::decay<decltype(k)>::type>()(k);
+            size_t stripe = h & (KEY_STRIPES-1);
+            std::lock_guard<std::mutex> guard(keyMutexStripes_[stripe]);
+            execF(i);
+          },
+          chunk
+        );
+    }
+
+
 };
 
 // =============================================================

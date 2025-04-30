@@ -71,7 +71,7 @@ protected:
     ThreadPool* pool;
 
     void SetUp() override {
-        pool = new ThreadPool(4);  // 4 threads
+        pool = new ThreadPool(2*std::thread::hardware_concurrency());  // 4 threads
     }
 
     void TearDown() override {
@@ -2453,6 +2453,7 @@ TEST_F(ParallelForOrderedTests, HugeVectorPerformanceComparison) {
 
     // --- Multi‐threaded using index‐based parallelForOrdered ---
     std::vector<int> resultParallel(numElements);
+    printf("Using %zu threads\n", pool->getThreadCount());
     size_t chunk = pool->idealChunkSize(numElements, pool->getThreadCount(), /*F=*/4);
     std::cout << "Using chunk size: " << chunk << "\n";
     auto start_parallel = std::chrono::high_resolution_clock::now();

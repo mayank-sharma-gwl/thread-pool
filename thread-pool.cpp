@@ -191,10 +191,32 @@ void ThreadPool::printStatus() const
               << "  Paused: " << (paused_ ? "yes" : "no") << std::endl;
 }
 
-size_t ThreadPool::idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe = 4) {
+size_t ThreadPool::idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe=4) {
+    // Handle edge cases
+    if (N == 0) return 0;
+    if (numThreads == 0) numThreads = 1;
+    if (oversubscribe == 0) oversubscribe = 1;
+    
+    // Calculate total desired chunks
     size_t totalChunks = numThreads * oversubscribe;
-    if (totalChunks == 0) totalChunks = 1;
-    return (N + totalChunks - 1) / totalChunks;
+    
+    // Avoid having more chunks than items
+    totalChunks = std::min(totalChunks, N);
+    
+    // Calculate base chunk size and remainder
+    size_t baseChunkSize = N / totalChunks;
+    size_t remainder = N % totalChunks;
+    
+    // If chunk size is too small, reduce number of chunks
+    const size_t MIN_CHUNK_SIZE = 16;  // Minimum items per chunk to amortize overhead
+    if (baseChunkSize < MIN_CHUNK_SIZE) {
+        baseChunkSize = std::min(MIN_CHUNK_SIZE, N);
+        totalChunks = N / baseChunkSize + (remainder != 0 ? 1 : 0);
+        return baseChunkSize;
+    }
+    
+    // Round up chunk size if there's remainder to evenly distribute work
+    return baseChunkSize + (remainder != 0 ? 1 : 0);
 }
 
 // …later…
