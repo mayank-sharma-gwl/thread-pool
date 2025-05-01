@@ -355,14 +355,14 @@ public:
 
         // Enqueue the wrapped task
         {
-            std::lock_guard<std::mutex> ql(queueMutexes_[queueIndex]);
+            std::lock_guard<std::mutex> ql(queues_[queueIndex].mutex);
             struct ReadTask : ITask
             {
                 std::function<void()> func;
                 ReadTask(std::function<void()> f) : func(std::move(f)) {}
                 void run() override { func(); }
             };
-            taskQueues_[queueIndex].emplace_back(std::make_unique<ReadTask>(std::move(safeRead)));
+            queues_[queueIndex].tasks.emplace_back(std::make_unique<ReadTask>(std::move(safeRead)));
             tasksCount_.fetch_add(1, std::memory_order_release);
         }
 
@@ -389,14 +389,14 @@ public:
         size_t queueIndex = nextQueue++ % threadCount_;
 
         {
-            std::lock_guard<std::mutex> ql(queueMutexes_[queueIndex]);
+            std::lock_guard<std::mutex> ql(queues_[queueIndex].mutex);
             struct WriteTask : ITask
             {
                 std::function<void()> func;
                 WriteTask(std::function<void()> f) : func(std::move(f)) {}
                 void run() override { func(); }
             };
-            taskQueues_[queueIndex].emplace_back(std::make_unique<WriteTask>(std::move(safeWrite)));
+            queues_[queueIndex].tasks.emplace_back(std::make_unique<WriteTask>(std::move(safeWrite)));
             tasksCount_.fetch_add(1, std::memory_order_release);
         }
 
@@ -440,8 +440,8 @@ public:
     void resume();
     void waitForCompletion();
     void shutdown();
-    
-    //chunkSize calculator
+
+    // chunkSize calculator
     size_t idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe);
 
     // debug helper
@@ -465,13 +465,20 @@ private:
     std::atomic<std::size_t> rr_{0}; // round‑robin index
 
     std::vector<std::thread> threads_;
-    std::vector<std::deque<std::unique_ptr<ITask>>> taskQueues_;
-    std::vector<std::mutex> queueMutexes_;
+    // Cache-line–aligned per-thread queue + mutex
+    struct alignas(64) Queue
+    {
+        std::deque<std::unique_ptr<ITask>> tasks;
+        mutable std::mutex mutex;
+    };
+
+    // Replace separate queues+mutexes with one aligned struct per thread
+    std::vector<Queue> queues_;
 
     std::atomic<bool> acceptingTasks_{true};
     std::atomic<bool> paused_{false};
     std::atomic<bool> stopFlag_{false};
-    std::atomic<std::size_t> tasksCount_{0};
+    std::atomic<int64_t> tasksCount_{0};
 
     std::mutex masterMutex_;
     std::condition_variable tasksCV_, finishedCV_;
@@ -500,30 +507,32 @@ private:
             std::make_index_sequence<std::tuple_size<typename std::decay<Tuple>::type>::value>{});
     }
 
-// New functions to make it thread safe calls
+    // New functions to make it thread safe calls
 private:
     // threadSafeExecWithMutex (non-void)
-    template<typename Func, typename... Args,
-             typename Ret = typename std::result_of<Func(Args...)>::type,
-             typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
-    static Ret threadSafeExecWithMutex(std::mutex& m, Func&& fn, Args&&... as) {
+    template <typename Func, typename... Args,
+              typename Ret = typename std::result_of<Func(Args...)>::type,
+              typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
+    static Ret threadSafeExecWithMutex(std::mutex &m, Func &&fn, Args &&...as)
+    {
         std::lock_guard<std::mutex> lock(m);
         return fn(std::forward<Args>(as)...);
     }
     // threadSafeExecWithMutex (void)
-    template<typename Func, typename... Args,
-             typename Ret = typename std::result_of<Func(Args...)>::type,
-             typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
-    static void threadSafeExecWithMutex(std::mutex& m, Func&& fn, Args&&... as) {
+    template <typename Func, typename... Args,
+              typename Ret = typename std::result_of<Func(Args...)>::type,
+              typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
+    static void threadSafeExecWithMutex(std::mutex &m, Func &&fn, Args &&...as)
+    {
         std::lock_guard<std::mutex> lock(m);
         fn(std::forward<Args>(as)...);
     }
 
 public:
     // global-mutex wrapper
-    template<typename Func, typename... Args>
-    auto threadSafeExec(Func&& fn, Args&&... as)
-      -> typename std::result_of<Func(Args...)>::type
+    template <typename Func, typename... Args>
+    auto threadSafeExec(Func &&fn, Args &&...as)
+        -> typename std::result_of<Func(Args...)>::type
     {
         static std::mutex global_mutex;
         return threadSafeExecWithMutex(global_mutex,
@@ -534,61 +543,66 @@ public:
     // ----------------------------------------------------------------
     // threadSafeRead / threadSafeWrite (shared_mutex, C++14)
     // ----------------------------------------------------------------
-    template<typename Mutex, typename Func, typename... Args>
-    auto threadSafeExec(Mutex& mutex, Func&& fn, Args&&... as)
-      -> typename std::result_of<Func(Args...)>::type
+    template <typename Mutex, typename Func, typename... Args>
+    auto threadSafeExec(Mutex &mutex, Func &&fn, Args &&...as)
+        -> typename std::result_of<Func(Args...)>::type
     {
         return threadSafeExecWithMutex(mutex,
                                        std::forward<Func>(fn),
                                        std::forward<Args>(as)...);
     }
+
 private:
     // read (non-void)
-    template<typename RWMutex, typename Func, typename... Args,
-             typename Ret = typename std::result_of<Func(Args...)>::type,
-             typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
-    static Ret threadSafeReadWithMutex(RWMutex& m, Func&& fn, Args&&... as) {
+    template <typename RWMutex, typename Func, typename... Args,
+              typename Ret = typename std::result_of<Func(Args...)>::type,
+              typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
+    static Ret threadSafeReadWithMutex(RWMutex &m, Func &&fn, Args &&...as)
+    {
         std::shared_lock<RWMutex> lock(m);
         return fn(std::forward<Args>(as)...);
     }
     // read (void)
-    template<typename RWMutex, typename Func, typename... Args,
-             typename Ret = typename std::result_of<Func(Args...)>::type,
-             typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
-    static void threadSafeReadWithMutex(RWMutex& m, Func&& fn, Args&&... as) {
+    template <typename RWMutex, typename Func, typename... Args,
+              typename Ret = typename std::result_of<Func(Args...)>::type,
+              typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
+    static void threadSafeReadWithMutex(RWMutex &m, Func &&fn, Args &&...as)
+    {
         std::shared_lock<RWMutex> lock(m);
         fn(std::forward<Args>(as)...);
     }
     // write (non-void)
-    template<typename RWMutex, typename Func, typename... Args,
-             typename Ret = typename std::result_of<Func(Args...)>::type,
-             typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
-    static Ret threadSafeWriteWithMutex(RWMutex& m, Func&& fn, Args&&... as) {
+    template <typename RWMutex, typename Func, typename... Args,
+              typename Ret = typename std::result_of<Func(Args...)>::type,
+              typename std::enable_if<!std::is_void<Ret>::value, int>::type = 0>
+    static Ret threadSafeWriteWithMutex(RWMutex &m, Func &&fn, Args &&...as)
+    {
         std::unique_lock<RWMutex> lock(m);
         return fn(std::forward<Args>(as)...);
     }
     // write (void)
-    template<typename RWMutex, typename Func, typename... Args,
-             typename Ret = typename std::result_of<Func(Args...)>::type,
-             typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
-    static void threadSafeWriteWithMutex(RWMutex& m, Func&& fn, Args&&... as) {
+    template <typename RWMutex, typename Func, typename... Args,
+              typename Ret = typename std::result_of<Func(Args...)>::type,
+              typename std::enable_if<std::is_void<Ret>::value, int>::type = 0>
+    static void threadSafeWriteWithMutex(RWMutex &m, Func &&fn, Args &&...as)
+    {
         std::unique_lock<RWMutex> lock(m);
         fn(std::forward<Args>(as)...);
     }
 
 public:
-    template<typename RWMutex, typename Func, typename... Args>
-    auto threadSafeRead(RWMutex& m, Func&& fn, Args&&... as)
-      -> typename std::result_of<Func(Args...)>::type
+    template <typename RWMutex, typename Func, typename... Args>
+    auto threadSafeRead(RWMutex &m, Func &&fn, Args &&...as)
+        -> typename std::result_of<Func(Args...)>::type
     {
         return threadSafeReadWithMutex(m,
                                        std::forward<Func>(fn),
                                        std::forward<Args>(as)...);
     }
 
-    template<typename RWMutex, typename Func, typename... Args>
-    auto threadSafeWrite(RWMutex& m, Func&& fn, Args&&... as)
-      -> typename std::result_of<Func(Args...)>::type
+    template <typename RWMutex, typename Func, typename... Args>
+    auto threadSafeWrite(RWMutex &m, Func &&fn, Args &&...as)
+        -> typename std::result_of<Func(Args...)>::type
     {
         return threadSafeWriteWithMutex(m,
                                         std::forward<Func>(fn),
@@ -600,36 +614,31 @@ public:
     // ----------------------------------------------------------------
 
 private:
-    static constexpr size_t KEY_STRIPES = 256;  // power of two
+    static constexpr size_t KEY_STRIPES = 256; // power of two
     std::array<std::mutex, KEY_STRIPES> keyMutexStripes_;
 
 public:
-    template<typename Index, typename KeyFunc, typename ExecFunc>
+    template <typename Index, typename KeyFunc, typename ExecFunc>
     void parallelForThreadSafe(
         Index first, Index last,
-        KeyFunc  keyFunc,
+        KeyFunc keyFunc,
         ExecFunc execFunc,
-        std::size_t chunk = 1
-    ) {
-        static_assert((KEY_STRIPES & (KEY_STRIPES-1))==0,
+        std::size_t chunk = 1)
+    {
+        static_assert((KEY_STRIPES & (KEY_STRIPES - 1)) == 0,
                       "KEY_STRIPES must be power of two");
 
-        KeyFunc  keyF  = std::move(keyFunc);
+        KeyFunc keyF = std::move(keyFunc);
         ExecFunc execF = std::move(execFunc);
 
-        parallelFor(first, last,
-          [this, keyF = std::move(keyF), execF = std::move(execF)](Index i) {
+        parallelFor(first, last, [this, keyF = std::move(keyF), execF = std::move(execF)](Index i)
+                    {
             auto k = keyF(i);
             auto h = std::hash<typename std::decay<decltype(k)>::type>()(k);
             size_t stripe = h & (KEY_STRIPES-1);
             std::lock_guard<std::mutex> guard(keyMutexStripes_[stripe]);
-            execF(i);
-          },
-          chunk
-        );
+            execF(i); }, chunk);
     }
-
-
 };
 
 // =============================================================
@@ -658,8 +667,8 @@ auto ThreadPool::enqueue(Func &&f, Args &&...args)
 
     std::size_t idx = rr_.fetch_add(1, std::memory_order_relaxed) % threadCount_;
     {
-        std::lock_guard<std::mutex> lk(queueMutexes_[idx]);
-        taskQueues_[idx].emplace_back(std::make_unique<Task<Packaged>>(std::move(task)));
+        std::lock_guard<std::mutex> lk(queues_[idx].mutex);
+        queues_[idx].tasks.emplace_back(std::make_unique<Task<Packaged>>(std::move(task)));
     }
     tasksCount_.fetch_add(1, std::memory_order_release);
     tasksCV_.notify_one();

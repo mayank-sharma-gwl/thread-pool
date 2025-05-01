@@ -9,11 +9,10 @@ thread_local bool ThreadPool::isWorkerThread_ = false;
 // Constructor
 //--------------------------------------------------------------------
 ThreadPool::ThreadPool(std::size_t threadCount, bool completeOnDestruction)
-    : syncMode_(threadCount == 0),
-      threadCount_(threadCount ? threadCount : 1),
+    : threadCount_(threadCount ? threadCount : 1),
+      syncMode_(threadCount == 0),
       completeOnDestruction_(completeOnDestruction),
-      taskQueues_(threadCount_),
-      queueMutexes_(threadCount_)
+      queues_(threadCount_)
 {
     // If threadCount_ is zero, pool works synchronously (enqueue executes inline)
     if (threadCount_ > 0)
@@ -44,13 +43,13 @@ void ThreadPool::pause()
 
 void ThreadPool::resume()
 {
+    paused_.store(false, std::memory_order_release);
+    // release a token for each pending task so workers reawaken
+    size_t pending = 0;
+    for (size_t i = 0; i < threadCount_; ++i)
     {
-        std::unique_lock<std::mutex> lock(masterMutex_);
-        if (!paused_.load(std::memory_order_relaxed))
-        {
-            return; // already running
-        }
-        paused_.store(false, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(queues_[i].mutex);
+        pending += queues_[i].tasks.size();
     }
     // Wake all workers so they re-evaluate the pause condition
     tasksCV_.notify_all();
@@ -83,9 +82,9 @@ void ThreadPool::shutdown()
     }
     { // Signal all worker threads to terminate
         std::unique_lock<std::mutex> lock(masterMutex_);
-        stopFlag_.store(true, std::memory_order_relaxed);
+    stopFlag_.store(true, std::memory_order_relaxed);
         // If paused, resume to let threads exit
-        paused_.store(false, std::memory_order_relaxed);
+    paused_.store(false, std::memory_order_relaxed);
     }
     tasksCV_.notify_all(); // wake all workers so they can exit
     // Join all threads
@@ -101,11 +100,8 @@ void ThreadPool::shutdown()
         // Clear any remaining tasks without executing them
         for (size_t i = 0; i < threadCount_; ++i)
         {
-            std::lock_guard<std::mutex> lock(queueMutexes_[i]);
-            while (!taskQueues_[i].empty())
-            {
-                taskQueues_[i].pop_front(); // discard tasks
-            }
+            std::lock_guard<std::mutex> lk(queues_[i].mutex); 
+            queues_[i].tasks.clear();
         }
         // Mark all tasks as completed (discarded) and notify any waiters
         tasksCount_.store(0, std::memory_order_relaxed);
@@ -135,18 +131,18 @@ void ThreadPool::workerThread(std::size_t idx)
         std::unique_ptr<ITask> task;
         // 1. Local queue (LIFO when pool has >1 thread)
         {
-            std::lock_guard<std::mutex> ql(queueMutexes_[idx]);
-            if (!taskQueues_[idx].empty())
+            std::lock_guard<std::mutex> ql(queues_[idx].mutex);
+            if (!queues_[idx].tasks.empty())
             {
                 if (threadCount_ == 1)
                 {
-                    task = std::move(taskQueues_[idx].front());
-                    taskQueues_[idx].pop_front();
+                    task = std::move(queues_[idx].tasks.front());
+                    queues_[idx].tasks.pop_front();
                 }
                 else
                 {
-                    task = std::move(taskQueues_[idx].back());
-                    taskQueues_[idx].pop_back();
+                    task = std::move(queues_[idx].tasks.back());
+                    queues_[idx].tasks.pop_back();
                 }
             }
         }
@@ -156,11 +152,11 @@ void ThreadPool::workerThread(std::size_t idx)
             for (std::size_t off = 1; off < threadCount_; ++off)
             {
                 std::size_t victim = (idx + off) % threadCount_;
-                std::lock_guard<std::mutex> ql(queueMutexes_[victim]);
-                if (!taskQueues_[victim].empty())
+                std::lock_guard<std::mutex> ql(queues_[victim].mutex);
+                if (!queues_[victim].tasks.empty())
                 {
-                    task = std::move(taskQueues_[victim].front());
-                    taskQueues_[victim].pop_front();
+                    task = std::move(queues_[victim].tasks.front());
+                    queues_[victim].tasks.pop_front();
                     break;
                 }
             }
@@ -181,40 +177,56 @@ void ThreadPool::workerThread(std::size_t idx)
 void ThreadPool::printStatus() const
 {
     std::size_t pending = 0;
-    for (const auto &q : taskQueues_)
-        pending += q.size();
+    // Sum up all pending tasks under each queue's lock
+    for (const auto &q : queues_)
+    {
+        std::lock_guard<std::mutex> lk(q.mutex);
+        pending += q.tasks.size();
+    }
+
+    // Load outstanding‐tasks count with acquire‐fence to pair with enqueue()'s release
+    std::size_t totalOutstanding = tasksCount_.load(std::memory_order_acquire);
+    // Prevent underflow if there's a momentary race
+    std::size_t running = totalOutstanding > pending
+                              ? totalOutstanding - pending
+                              : 0;
 
     std::cout << "\n[ThreadPool] Threads: " << threadCount_
               << "  Pending: " << pending
-              << "  Running: " << (tasksCount_.load() - pending)
+              << "  Running: " << running
               << "  Accepting: " << (acceptingTasks_ ? "yes" : "no")
               << "  Paused: " << (paused_ ? "yes" : "no") << std::endl;
 }
 
-size_t ThreadPool::idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe=4) {
+size_t ThreadPool::idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe = 4)
+{
     // Handle edge cases
-    if (N == 0) return 0;
-    if (numThreads == 0) numThreads = 1;
-    if (oversubscribe == 0) oversubscribe = 1;
-    
+    if (N == 0)
+        return 0;
+    if (numThreads == 0)
+        numThreads = 1;
+    if (oversubscribe == 0)
+        oversubscribe = 1;
+
     // Calculate total desired chunks
     size_t totalChunks = numThreads * oversubscribe;
-    
+
     // Avoid having more chunks than items
     totalChunks = std::min(totalChunks, N);
-    
+
     // Calculate base chunk size and remainder
     size_t baseChunkSize = N / totalChunks;
     size_t remainder = N % totalChunks;
-    
+
     // If chunk size is too small, reduce number of chunks
-    const size_t MIN_CHUNK_SIZE = 16;  // Minimum items per chunk to amortize overhead
-    if (baseChunkSize < MIN_CHUNK_SIZE) {
+    const size_t MIN_CHUNK_SIZE = 16; // Minimum items per chunk to amortize overhead
+    if (baseChunkSize < MIN_CHUNK_SIZE)
+    {
         baseChunkSize = std::min(MIN_CHUNK_SIZE, N);
         totalChunks = N / baseChunkSize + (remainder != 0 ? 1 : 0);
         return baseChunkSize;
     }
-    
+
     // Round up chunk size if there's remainder to evenly distribute work
     return baseChunkSize + (remainder != 0 ? 1 : 0);
 }
