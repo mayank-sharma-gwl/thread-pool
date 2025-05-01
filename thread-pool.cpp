@@ -2,8 +2,13 @@
 // ------------------------------------------------------------------
 #include "thread-pool.h"
 #include <iostream>
+#include <thread> // for std::this_thread::yield
+#include <cassert>
+#include <mutex> // for std::unique_lock, std::lock_guard
+#include <atomic>
 
 thread_local bool ThreadPool::isWorkerThread_ = false;
+thread_local std::size_t ThreadPool::myIndex_ = 0;
 
 //--------------------------------------------------------------------
 // Constructor
@@ -12,7 +17,8 @@ ThreadPool::ThreadPool(std::size_t threadCount, bool completeOnDestruction)
     : threadCount_(threadCount ? threadCount : 1),
       syncMode_(threadCount == 0),
       completeOnDestruction_(completeOnDestruction),
-      queues_(threadCount_)
+      queues_(threadCount_),
+      stealCounts_(threadCount_)
 {
     // If threadCount_ is zero, pool works synchronously (enqueue executes inline)
     if (threadCount_ > 0)
@@ -37,35 +43,114 @@ ThreadPool::~ThreadPool()
 void ThreadPool::pause()
 {
     std::unique_lock<std::mutex> lock(masterMutex_);
-    paused_.store(true, std::memory_order_relaxed);
+    paused_.store(true, std::memory_order_release);
     // No need to notify here; workers will check `paused_` in their wait predicate
 }
 
 void ThreadPool::resume()
 {
-    paused_.store(false, std::memory_order_release);
-    // release a token for each pending task so workers reawaken
-    size_t pending = 0;
-    for (size_t i = 0; i < threadCount_; ++i)
+    // paused_.store(false, std::memory_order_release);
+    // // release a token for each pending task so workers reawaken
+    // size_t pending = 0;
+    // for (size_t i = 0; i < threadCount_; ++i)
+    // {
+    //     std::lock_guard<std::mutex> lk(queues_[i].mutex);
+    //     pending += queues_[i].tasks.size();
+    // }
+    // // Wake all workers so they re-evaluate the pause condition
+    // tasksCV_.notify_all();
+    // Hold the same masterMutex_ while unpausing & notifying
     {
-        std::lock_guard<std::mutex> lk(queues_[i].mutex);
-        pending += queues_[i].tasks.size();
+        std::lock_guard<std::mutex> lock(masterMutex_);
+        // Unpause with release‐semantics
+        paused_.store(false, std::memory_order_release);
+        // Wake all threads so they re-check the predicate
+        tasksCV_.notify_all();
     }
-    // Wake all workers so they re-evaluate the pause condition
-    tasksCV_.notify_all();
 }
 
 //--------------------------------------------------------------------
 // waitForCompletion (external threads only)
 //--------------------------------------------------------------------
+// void ThreadPool::waitForCompletion()
+// {
+//     if (isWorkerThread_)
+//         throw std::logic_error("ThreadPool::waitForCompletion() cannot be called from worker thread");
+
+//     std::unique_lock<std::mutex> lk(masterMutex_);
+//     finishedCV_.wait(lk, [this]
+//                      { return tasksCount_.load(std::memory_order_acquire) == 0; });
+// }
 void ThreadPool::waitForCompletion()
 {
-    if (isWorkerThread_)
-        throw std::logic_error("ThreadPool::waitForCompletion() cannot be called from worker thread");
+    if (!isWorkerThread_)
+    {
+        std::unique_lock<std::mutex> lk(masterMutex_);
+        finishedCV_.wait(lk, [&]
+                         { return tasksCount_ == 0; });
+        return;
+    }
 
-    std::unique_lock<std::mutex> lk(masterMutex_);
-    finishedCV_.wait(lk, [this]
-                     { return tasksCount_.load(std::memory_order_acquire) == 0; });
+    // if we *are* a worker, instead of throwing, we steal+run until done:
+    while (tasksCount_.load(std::memory_order_acquire) > 1)
+    {
+        if (!runOneTask())
+        {
+            // no local work: try to steal
+            stealAndRunOne();
+        }
+    }
+}
+
+bool ThreadPool::runOneTask()
+{
+    std::unique_ptr<ITask> t;
+    {
+        auto &Q = queues_[myIndex_];
+        std::lock_guard<std::mutex> lk(Q.mutex);
+        if (!Q.tasks.empty())
+        {
+            if (threadCount_ == 1)
+            {
+                t = std::move(Q.tasks.front());
+                Q.tasks.pop_front();
+            }
+            else
+            {
+                t = std::move(Q.tasks.back());
+                Q.tasks.pop_back();
+            }
+        }
+    }
+    if (t)
+    {
+        t->run();
+        if (tasksCount_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            finishedCV_.notify_all();
+        return true;
+    }
+    return false;
+}
+
+void ThreadPool::stealAndRunOne()
+{
+    for (std::size_t off = 1; off < threadCount_; ++off)
+    {
+        std::size_t victim = (myIndex_ + off) % threadCount_;
+        std::unique_lock<std::mutex> lk(queues_[victim].mutex, std::try_to_lock);
+        if (lk.owns_lock() && !queues_[victim].tasks.empty())
+        {
+            auto t = std::move(queues_[victim].tasks.front());
+            queues_[victim].tasks.pop_front();
+            lk.unlock();
+            t->run();
+            if (tasksCount_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                finishedCV_.notify_all();
+            return;
+        }
+    }
+    // no work found, yield to others
+    std::this_thread::yield();
 }
 
 //--------------------------------------------------------------------
@@ -81,10 +166,10 @@ void ThreadPool::shutdown()
         waitForCompletion();
     }
     { // Signal all worker threads to terminate
-        std::unique_lock<std::mutex> lock(masterMutex_);
-    stopFlag_.store(true, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(masterMutex_);
+        stopFlag_.store(true, std::memory_order_release);
         // If paused, resume to let threads exit
-    paused_.store(false, std::memory_order_relaxed);
+        paused_.store(false, std::memory_order_release);
     }
     tasksCV_.notify_all(); // wake all workers so they can exit
     // Join all threads
@@ -100,7 +185,7 @@ void ThreadPool::shutdown()
         // Clear any remaining tasks without executing them
         for (size_t i = 0; i < threadCount_; ++i)
         {
-            std::lock_guard<std::mutex> lk(queues_[i].mutex); 
+            std::lock_guard<std::mutex> lk(queues_[i].mutex);
             queues_[i].tasks.clear();
         }
         // Mark all tasks as completed (discarded) and notify any waiters
@@ -115,16 +200,17 @@ void ThreadPool::shutdown()
 void ThreadPool::workerThread(std::size_t idx)
 {
     isWorkerThread_ = true;
+    myIndex_ = idx;
     while (true)
     {
         // Wait for work or exit signal
         {
             std::unique_lock<std::mutex> lk(masterMutex_);
             tasksCV_.wait(lk, [this]
-                          { return stopFlag_.load(std::memory_order_relaxed) ||
-                                   (!paused_.load(std::memory_order_relaxed) &&
-                                    tasksCount_.load(std::memory_order_relaxed) > 0); });
-            if (stopFlag_.load(std::memory_order_relaxed))
+                          { return stopFlag_.load(std::memory_order_acquire) ||
+                                   (!paused_.load(std::memory_order_acquire) &&
+                                    tasksCount_.load(std::memory_order_acquire) > 0); });
+            if (stopFlag_.load(std::memory_order_acquire))
                 return;
         }
 
@@ -152,11 +238,16 @@ void ThreadPool::workerThread(std::size_t idx)
             for (std::size_t off = 1; off < threadCount_; ++off)
             {
                 std::size_t victim = (idx + off) % threadCount_;
-                std::lock_guard<std::mutex> ql(queues_[victim].mutex);
+                // std::lock_guard<std::mutex> ql(queues_[victim].mutex);
+                std::unique_lock<std::mutex> ql(queues_[victim].mutex, std::try_to_lock);
+                if (!ql.owns_lock() || queues_[victim].tasks.empty())
+                    continue;
                 if (!queues_[victim].tasks.empty())
                 {
                     task = std::move(queues_[victim].tasks.front());
                     queues_[victim].tasks.pop_front();
+                    // increment this worker’s steal count
+                    stealCounts_[idx].fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
             }
@@ -195,7 +286,15 @@ void ThreadPool::printStatus() const
               << "  Pending: " << pending
               << "  Running: " << running
               << "  Accepting: " << (acceptingTasks_ ? "yes" : "no")
-              << "  Paused: " << (paused_ ? "yes" : "no") << std::endl;
+              << "  Paused: " << (paused_ ? "yes" : "no");
+    // show per-worker steal counts
+    auto steals = getStealCounts();
+    std::cout << "  Steals:";
+    for (size_t i = 0; i < steals.size(); ++i)
+    {
+        std::cout << (i == 0 ? " " : ", ") << steals[i];
+    }
+    std::cout << std::endl;
 }
 
 size_t ThreadPool::idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe = 4)
@@ -234,3 +333,27 @@ size_t ThreadPool::idealChunkSize(size_t N, size_t numThreads, size_t oversubscr
 // …later…
 // size_t chunk = idealChunkSize(numElements, pool->getThreadCount(), /*F=*/4);
 // pool->parallelForOrdered(0, numElements, yourFunc, chunk);
+// ----------------------------------------------------------------------------
+// Accessors for testing / introspection
+// ----------------------------------------------------------------------------
+
+std::vector<size_t> ThreadPool::getStealCounts() const
+{
+    std::vector<size_t> out(threadCount_);
+    for (size_t i = 0; i < threadCount_; ++i)
+    {
+        out[i] = stealCounts_[i].load(std::memory_order_relaxed);
+    }
+    return out;
+}
+
+std::vector<size_t> ThreadPool::getQueueSizes() const
+{
+    std::vector<size_t> out(threadCount_);
+    for (size_t i = 0; i < threadCount_; ++i)
+    {
+        std::lock_guard<std::mutex> lk(queues_[i].mutex);
+        out[i] = queues_[i].tasks.size();
+    }
+    return out;
+}

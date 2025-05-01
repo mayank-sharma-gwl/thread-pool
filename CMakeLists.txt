@@ -1,3 +1,5 @@
+set(CMAKE_C_COMPILER "/opt/homebrew/bin/gcc-14")
+set(CMAKE_CXX_COMPILER "/opt/homebrew/bin/g++-14")
 cmake_minimum_required(VERSION 3.10)
 project(thread_pool)
 
@@ -6,6 +8,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG -march=native -flto -funroll-loops -Wall -Wextra")
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -march=native -flto -funroll-loops -Wall -Wextra")
+
+message(STATUS "C++ compiler: ${CMAKE_CXX_COMPILER}")
+message(STATUS "C compiler: ${CMAKE_C_COMPILER}")
 
 # Set default package locations (customize these paths as needed)
 # These can be overridden by providing -DBOOST_ROOT or -DGTEST_ROOT when invoking CMake.

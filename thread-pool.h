@@ -104,6 +104,11 @@ public:
                         bool completeOnDestruction = true);
     ~ThreadPool();
 
+    /// Return how many successful steals each worker performed
+    std::vector<size_t> getStealCounts() const;
+    /// Return the current pending‐tasks count in each worker’s queue
+    std::vector<size_t> getQueueSizes() const;
+
     ThreadPool(const ThreadPool &) = delete;
     ThreadPool &operator=(const ThreadPool &) = delete;
 
@@ -441,6 +446,8 @@ public:
     void resume();
     void waitForCompletion();
     void shutdown();
+    void stealAndRunOne();
+    bool runOneTask();
 
     // chunkSize calculator
     size_t idealChunkSize(size_t N, size_t numThreads, size_t oversubscribe);
@@ -475,6 +482,7 @@ private:
 
     // Replace separate queues+mutexes with one aligned struct per thread
     std::vector<Queue> queues_;
+    std::vector<std::atomic<size_t>> stealCounts_;
 
     std::atomic<bool> acceptingTasks_{true};
     std::atomic<bool> paused_{false};
@@ -485,6 +493,7 @@ private:
     std::condition_variable tasksCV_, finishedCV_;
 
     static thread_local bool isWorkerThread_;
+    static thread_local std::size_t  myIndex_; 
 
     // Helper function to unpack and apply arguments from a tuple to a function (C++14 compatible)
     template <typename Func, typename Tuple, std::size_t... Indices>
@@ -677,53 +686,78 @@ auto ThreadPool::enqueue(Func &&f, Args &&...args)
 }
 
 // synchronous parallelFor (void)
-
-template <typename Index, typename Func>
-auto ThreadPool::parallelFor(Index first, Index last, Func &&func, std::size_t chunk)
-    -> typename std::enable_if<std::is_void<typename std::result_of<Func(Index)>::type>::value, void>::type
+template<typename Index, typename Func>
+auto ThreadPool::parallelFor(Index first, Index last, Func&& func, std::size_t chunk)
+  -> typename std::enable_if<
+         std::is_void<typename std::result_of<Func(Index)>::type>::value,
+         void
+     >::type
 {
-    if (first >= last || chunk == 0)
+    if (first >= last || chunk == 0) 
         return;
-    std::vector<std::future<void>> futs;
-    futs.reserve((last - first + chunk - 1) / chunk);
-    for (Index start = first; start < last; start += chunk)
-    {
+
+    // 1) enqueue all the chunks
+    std::vector<std::future<void>> futures;
+    futures.reserve((last - first + chunk - 1) / chunk);
+
+    for (Index start = first; start < last; start += chunk) {
         Index end = std::min(start + static_cast<Index>(chunk), last);
-        futs.emplace_back(enqueue([=, func = std::forward<Func>(func)]
-                                  {
-            for(Index i=start;i<end;++i) func(i); }));
+        futures.emplace_back(enqueue(
+            [=, func = std::forward<Func>(func)]() mutable {
+                for (Index i = start; i < end; ++i)
+                    func(i);
+            }
+        ));
     }
-    // wait + propagate
-    for (auto &f : futs)
+
+    // 2) help finish *all* outstanding tasks (including these)
+    waitForCompletion();
+
+    // 3) propagate any exceptions (futures are now ready, so get() won’t block)
+    for (auto &f : futures)
         f.get();
 }
 
-// synchronous parallelFor (non-void): returns gathered results
-
-template <typename Index, typename Func>
-auto ThreadPool::parallelFor(Index first, Index last, Func &&func, std::size_t chunk)
-    -> typename std::enable_if<!std::is_void<typename std::result_of<Func(Index)>::type>::value, std::vector<typename std::result_of<Func(Index)>::type>>::type
+// synchronous parallelFor (non-void)
+template<typename Index, typename Func>
+auto ThreadPool::parallelFor(Index first, Index last, Func&& func, std::size_t chunk)
+  -> typename std::enable_if<
+         !std::is_void<typename std::result_of<Func(Index)>::type>::value,
+         std::vector<typename std::result_of<Func(Index)>::type>
+     >::type
 {
     using Ret = typename std::result_of<Func(Index)>::type;
-    std::vector<std::future<Ret>> futs;
+
     if (first >= last || chunk == 0)
         return {};
-    futs.reserve((last - first + chunk - 1) / chunk);
-    for (Index start = first; start < last; start += chunk)
-    {
+
+    // 1) enqueue all the chunks
+    std::vector<std::future<Ret>> futures;
+    futures.reserve((last - first + chunk - 1) / chunk);
+
+    for (Index start = first; start < last; start += chunk) {
         Index end = std::min(start + static_cast<Index>(chunk), last);
-        futs.emplace_back(enqueue([=, func = std::forward<Func>(func)]() -> Ret
-                                  {
-            Ret val{};
-            for(Index i=start;i<end;++i) val=func(i);
-            return val; }));
+        futures.emplace_back(enqueue(
+            [=, func = std::forward<Func>(func)]() mutable -> Ret {
+                Ret val{};
+                for (Index i = start; i < end; ++i)
+                    val = func(i);
+                return val;
+            }
+        ));
     }
-    std::vector<Ret> collected;
-    collected.reserve(futs.size());
-    for (auto &f : futs)
-        collected.emplace_back(f.get());
-    return collected;
+
+    // 2) help finish *all* outstanding tasks
+    waitForCompletion();
+
+    // 3) collect results (no blocking, futures already ready)
+    std::vector<Ret> results;
+    results.reserve(futures.size());
+    for (auto &f : futures)
+        results.emplace_back(f.get());
+    return results;
 }
+
 
 // asynchronous wrapper returning MultiFuture<void>
 
