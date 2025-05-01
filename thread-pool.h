@@ -18,6 +18,7 @@
 #include <boost/thread/shared_mutex.hpp>
 #include <boost/thread/lock_types.hpp>
 #include <shared_mutex>
+#include <array>
 // ------------------------------------------------------------
 // MultiFuture: aggregate several std::future<R>
 // ------------------------------------------------------------
