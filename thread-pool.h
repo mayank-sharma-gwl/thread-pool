@@ -181,6 +181,14 @@ public:
         if (start >= end)
             return;
         
+        // When no worker threads exist, simply execute sequentially
+        if (getThreadCount() == 0) {
+            for (IndexType i = start; i < end; ++i) {
+                func(i);
+            }
+            return;
+        }
+
         if (chunkSize == 0)
             chunkSize = (end - start + getThreadCount() - 1) / getThreadCount();
 
