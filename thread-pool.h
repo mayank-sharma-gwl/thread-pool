@@ -11,12 +11,22 @@
 #include <atomic>
 #include <stdexcept>
 #include <shared_mutex>
-#include <boost/thread/shared_mutex.hpp>
-#include <boost/thread/lock_types.hpp>
-#include <iostream>
+// #include <boost/thread/shared_mutex.hpp> // No longer needed
+// #include <boost/thread/lock_types.hpp>   // No longer needed
+#include <iostream> // For std::cout, std::cerr (used in printStatus, optionally in workerThread)
 #include <tuple>
 #include <utility>
 #include <algorithm>
+#include "moodycamel/concurrentqueue.h"
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h> // For cpu_set_t, CPU_ZERO, CPU_SET
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
+// For std::cerr (optional logging) - Covered by iostream above
+
 
 class ThreadPool {
 public:
@@ -36,8 +46,6 @@ public:
 #else
     mutable std::shared_timed_mutex rwMutex; // C++14 fallback
 #endif
-    
-    boost::shared_mutex sharedObjRWMutex;
     
     // Enqueue a new task and get a future to its result.
     template<typename Func, typename... Args>
@@ -64,10 +72,7 @@ public:
         auto                       taskWrapper = std::make_unique<Task<TaskType>>(std::move(task));
         static std::atomic<size_t> roundRobinIndex{0};
         size_t                     idx = roundRobinIndex.fetch_add(1, std::memory_order_relaxed) % threadCount_;
-        {
-            std::lock_guard<std::mutex> lock(queueMutexes_[idx]);
-            taskQueues_[idx].push_back(std::move(taskWrapper));
-        }
+        taskQueues_[idx].enqueue(std::move(taskWrapper));
         // Update task count and notify one worker
         tasksCount_.fetch_add(1, std::memory_order_release);
         if (!paused_.load(std::memory_order_relaxed)) {
@@ -77,70 +82,6 @@ public:
     }
 
     /// Run a read-only task on sharedObject allowing parallel readers.
-    /// @tparam T        Type of the shared object
-    /// @tparam Callable A callable taking (T&), e.g. a lambda
-    template<typename T, typename Callable>
-    void enqueueThreadSafeRead(T& sharedObject, Callable&& task) {
-        // Wrap the user task in a shared-lock
-        auto safeRead = [this, &sharedObject, task = std::forward<Callable>(task)]() mutable {
-            boost::shared_lock<boost::shared_mutex> lock(sharedObjRWMutex);
-            task(sharedObject);
-        };
-
-        // Reject if pool is shutting down
-        if (!acceptingTasks_.load(std::memory_order_relaxed))
-            throw std::runtime_error("ThreadPool is not accepting new tasks");
-
-        // Round-robin pick a queue
-        static std::atomic<size_t> nextQueue{0};
-        size_t                     queueIndex = nextQueue++ % threadCount_;
-
-        // Enqueue the wrapped task
-        {
-            std::lock_guard<std::mutex> ql(queueMutexes_[queueIndex]);
-            struct ReadTask : ITask {
-                std::function<void()> func;
-                ReadTask(std::function<void()> f) : func(std::move(f)) {}
-                void run() override { func(); }
-            };
-            taskQueues_[queueIndex].emplace_back(std::make_unique<ReadTask>(std::move(safeRead)));
-            tasksCount_.fetch_add(1, std::memory_order_release);
-        }
-
-        tasksCV_.notify_one();
-    }
-
-    /// Run a read-write task on sharedObject, exclusive of all others.
-    /// @tparam T        Type of the shared object
-    /// @tparam Callable A callable taking (T&), e.g. a lambda
-    template<typename T, typename Callable>
-    void enqueueThreadSafeWrite(T& sharedObject, Callable&& task) {
-        // Wrap the user task in a unique-lock
-        auto safeWrite = [this, &sharedObject, task = std::forward<Callable>(task)]() mutable {
-            boost::unique_lock<boost::shared_mutex> lock(sharedObjRWMutex);
-            task(sharedObject);
-        };
-
-        if (!acceptingTasks_.load(std::memory_order_relaxed))
-            throw std::runtime_error("ThreadPool is not accepting new tasks");
-
-        static std::atomic<size_t> nextQueue{0};
-        size_t                     queueIndex = nextQueue++ % threadCount_;
-
-        {
-            std::lock_guard<std::mutex> ql(queueMutexes_[queueIndex]);
-            struct WriteTask : ITask {
-                std::function<void()> func;
-                WriteTask(std::function<void()> f) : func(std::move(f)) {}
-                void run() override { func(); }
-            };
-            taskQueues_[queueIndex].emplace_back(std::make_unique<WriteTask>(std::move(safeWrite)));
-            tasksCount_.fetch_add(1, std::memory_order_release);
-        }
-
-        tasksCV_.notify_one();
-    }
-
     template<typename Func, typename... Args>
     auto parallelRead(Func&& func, Args&&... args) -> std::future<decltype(func(args...))> {
         // Store arguments in a tuple to capture them in the lambda
@@ -192,11 +133,11 @@ public:
             IndexType chunkEnd = std::min(chunkStart + static_cast<IndexType>(chunkSize), end);
 
             // Perfect-forward func into task-specific copy
-            auto taskFunc = std::forward<Func>(func);
-
-            futures.emplace_back(enqueue([chunkStart, chunkEnd, func = std::move(taskFunc)]() mutable {
+            // Corrected capture: 'func' (the parameter of parallelFor) is an lvalue here.
+            // Capturing it by copy [func_copy = func] ensures each task gets its own copy.
+            futures.emplace_back(enqueue([chunkStart, chunkEnd, func_copy = func]() mutable {
                 for (IndexType i = chunkStart; i < chunkEnd; ++i) {
-                    func(i); // Execute user function
+                    func_copy(i); // Execute user function with its copy
                 }
             }));
         }
@@ -258,8 +199,7 @@ private:
     bool   completeOnDestruction_;
 
     std::vector<std::thread>                              threads_;
-    std::unique_ptr<std::deque<std::unique_ptr<ITask>>[]> taskQueues_;   // per-thread task deques
-    std::unique_ptr<std::mutex[]>                         queueMutexes_; // per-queue mutexes
+    std::unique_ptr<moodycamel::ConcurrentQueue<std::unique_ptr<ITask>>[]> taskQueues_;   // per-thread task deques
 
     std::atomic<bool>   acceptingTasks_{true};
     std::atomic<bool>   paused_{false};

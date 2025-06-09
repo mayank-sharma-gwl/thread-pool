@@ -1,4 +1,5 @@
 #include "thread-pool.h"
+#include "moodycamel/concurrentqueue.h" // Required for ConcurrentQueue
 
 thread_local bool ThreadPool::isWorkerThread_ = false;
 
@@ -10,9 +11,9 @@ ThreadPool::ThreadPool(size_t threadCount, bool complete_on_destruction)
     // Only create worker threads and task queues if threadCount_ > 0.
     if (threadCount_ > 0)
     {
-        // Initialize task queues and corresponding mutexes
-        taskQueues_.reset(new std::deque<std::unique_ptr<ITask>>[threadCount_]);
-        queueMutexes_.reset(new std::mutex[threadCount_]);
+        // Initialize task queues
+        taskQueues_.reset(new moodycamel::ConcurrentQueue<std::unique_ptr<ITask>>[threadCount_]);
+        // queueMutexes_ is removed
         // Launch worker threads
         threads_.reserve(threadCount_);
         for (size_t i = 0; i < threadCount_; ++i)
@@ -89,10 +90,12 @@ void ThreadPool::shutdown()
         // Clear any remaining tasks without executing them
         for (size_t i = 0; i < threadCount_; ++i)
         {
-            std::lock_guard<std::mutex> lock(queueMutexes_[i]);
-            while (!taskQueues_[i].empty())
-            {
-                taskQueues_[i].pop_front(); // discard tasks
+            // No lock needed for moodycamel::ConcurrentQueue
+            std::unique_ptr<ITask> discarded_task;
+            while (taskQueues_[i].try_dequeue(discarded_task)) {
+                // Task is removed and its std::unique_ptr is destroyed,
+                // decrementing tasksCount_ is handled by the original logic
+                // or by the fact that these tasks were never started.
             }
         }
         // Mark all tasks as completed (discarded) and notify any waiters
@@ -107,6 +110,35 @@ void ThreadPool::workerThread(size_t index)
     // workerThreadIds_[index] = std::this_thread::get_id();
 
     isWorkerThread_ = true;
+
+#if defined(__linux__)
+    if (threadCount_ > 0) { // Ensure there are threads to pin
+        unsigned int num_cores = std::thread::hardware_concurrency();
+        if (num_cores > 0) {
+            int core_id_to_pin = index % num_cores;
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(core_id_to_pin, &cpuset);
+            pthread_t native_thread_handle = pthread_self();
+            if (pthread_setaffinity_np(native_thread_handle, sizeof(cpu_set_t), &cpuset) != 0) {
+                // Optional: std::cerr << "Failed to set affinity for thread " << index << " to core " << core_id_to_pin << std::endl;
+            }
+        }
+    }
+#elif defined(_WIN32)
+    if (threadCount_ > 0) { // Ensure there are threads to pin
+        unsigned int num_cores = std::thread::hardware_concurrency();
+        if (num_cores > 0) {
+            int core_id_to_pin = index % num_cores;
+            DWORD_PTR affinityMask = 1ULL << core_id_to_pin;
+            HANDLE native_thread_handle = GetCurrentThread(); // For Windows, GetCurrentThread() returns a pseudo-handle
+            if (SetThreadAffinityMask(native_thread_handle, affinityMask) == 0) {
+                // Optional: std::cerr << "Failed to set affinity for thread " << index << " to core " << core_id_to_pin << " (Error: " << GetLastError() << ")" << std::endl;
+            }
+        }
+    }
+#endif
+
     for (;;)
     {
         // Wait for a task to be available or for shutdown/pause signals
@@ -125,34 +157,22 @@ void ThreadPool::workerThread(size_t index)
         // Fetch a task if available
         std::unique_ptr<ITask> task;
         // 1. Try to get a task from this thread's own queue
-        {
-            std::lock_guard<std::mutex> qlock(queueMutexes_[index]);
-            if (!taskQueues_[index].empty())
-            {
-                // If only one thread, use FIFO (pop_front); otherwise use LIFO (pop_back)
-                if (threadCount_ == 1)
-                {
-                    task = std::move(taskQueues_[index].front());
-                    taskQueues_[index].pop_front();
-                }
-                else
-                {
-                    task = std::move(taskQueues_[index].back());
-                    taskQueues_[index].pop_back();
-                }
-            }
-        }
+        taskQueues_[index].try_dequeue(task);
+
         // 2. If none, attempt to steal a task from another thread's queue (FIFO order)
-        if (!task)
-        {
-            for (size_t offset = 1; offset < threadCount_; ++offset)
-            {
-                size_t victim = (index + offset) % threadCount_;
-                std::lock_guard<std::mutex> qlock(queueMutexes_[victim]);
-                if (!taskQueues_[victim].empty())
-                {
-                    task = std::move(taskQueues_[victim].front());
-                    taskQueues_[victim].pop_front();
+        if (!task) { // If no task from own queue, try to steal
+            for (size_t offset = 1; offset < threadCount_; ++offset) {
+                // It's good practice to check stopFlag_ periodically even during stealing attempts,
+                // though the main check is before this block and after waking from CV.
+                if (stopFlag_.load(std::memory_order_relaxed)) {
+                    break; // Exit stealing loop if stopping
+                }
+
+                size_t victim_index = (index + offset) % threadCount_;
+
+                // No lock needed for moodycamel::ConcurrentQueue's try_dequeue
+                if (taskQueues_[victim_index].try_dequeue(task)) {
+                    // Successfully stole a task
                     break;
                 }
             }
@@ -178,11 +198,14 @@ void ThreadPool::printStatus() const {
     std::vector<std::tuple<size_t, bool>> queueSnapshots;
     size_t totalPendingTasks = 0;
 
-    for (size_t i = 0; i < threadCount_; ++i) {
-        std::lock_guard<std::mutex> lock(queueMutexes_[i]);
-        bool isActive = (taskQueues_[i].size() > 0);
-        queueSnapshots.emplace_back(taskQueues_[i].size(), isActive);
-        totalPendingTasks += taskQueues_[i].size();
+    if (threadCount_ > 0) { // Check if taskQueues_ was initialized
+        for (size_t i = 0; i < threadCount_; ++i) {
+            // No lock needed for moodycamel::ConcurrentQueue's size_approx()
+            size_t queue_size = taskQueues_[i].size_approx();
+            bool isActive = (queue_size > 0);
+            queueSnapshots.emplace_back(queue_size, isActive);
+            totalPendingTasks += queue_size;
+        }
     }
 
     std::cout << "\n[ThreadPool] === Status ===\n";

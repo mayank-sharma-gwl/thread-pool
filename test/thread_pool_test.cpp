@@ -12,6 +12,7 @@
 #include <array>
 #include <mutex>
 #include <algorithm>
+#include <chrono> // For benchmarking
 
 using namespace std::chrono_literals;  // for using 100ms, etc.
 
@@ -1098,31 +1099,33 @@ TEST(ThreadPoolPerformance, UnevenHeavyLoadComparison) {
     }
 }
 
-// Test enqueueThreadSafeRead and enqueueThreadSafeWrite
+// Tests for parallelRead and parallelWrite (formerly enqueueThreadSafeRead/Write)
 TEST_F(ReaderWriterTests, ConcurrentReadsAllowed) {
     std::atomic<int> completedReads{0};
     static const int READ_TASKS = 100;
+    std::vector<std::future<void>> futures;
     
     // Launch many read tasks
     for (int i = 0; i < READ_TASKS; i++) {
-        pool->enqueueThreadSafeRead(sharedData, [&](SharedData& data) {
+        futures.emplace_back(pool->parallelRead([&](const SharedData& data) {
             // Track concurrent readers
-            int readers = data.readers.fetch_add(1) + 1;
+            int readers = sharedData.readers.fetch_add(1) + 1; // Use sharedData directly for atomics
             ASSERT_GE(readers, 1) << "Reader count should be at least 1";
-            ASSERT_EQ(data.writers.load(), 0) << "No writers should be active during reads";
+            ASSERT_EQ(sharedData.writers.load(), 0) << "No writers should be active during reads";
             
             // Simulate some work
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             
             // Record that we read
-            data.readCount++;
-            data.readers--;
+            sharedData.readCount++;
+            sharedData.readers--;
             completedReads++;
-        });
+        }, std::cref(sharedData)));
     }
     
     // Wait for all reads to complete
-    pool->waitForCompletion();
+    for(auto& fut : futures) fut.get();
+    pool->waitForCompletion(); // Ensure any underlying pool tasks complete
     
     // Verify all reads completed
     EXPECT_EQ(completedReads, READ_TASKS);
@@ -1133,10 +1136,11 @@ TEST_F(ReaderWriterTests, ConcurrentReadsAllowed) {
 TEST_F(ReaderWriterTests, ExclusiveWrites) {
     std::atomic<int> completedWrites{0};
     static const int WRITE_TASKS = 50;
+    std::vector<std::future<void>> futures;
     
     // Launch many write tasks
     for (int i = 0; i < WRITE_TASKS; i++) {
-        pool->enqueueThreadSafeWrite(sharedData, [i, &completedWrites](SharedData& data) {
+        futures.emplace_back(pool->parallelWrite([i, &completedWrites](SharedData& data) {
             // Ensure exclusive access
             int writers = data.writers.fetch_add(1) + 1;
             ASSERT_EQ(writers, 1) << "Only one writer should be active";
@@ -1150,26 +1154,28 @@ TEST_F(ReaderWriterTests, ExclusiveWrites) {
             data.writeCount++;
             data.writers--;
             completedWrites++;
-        });
+        }, std::ref(sharedData)));
     }
     
     // Wait for all writes to complete
-    pool->waitForCompletion();
-    
+    for(auto& fut : futures) fut.get();
+    pool->waitForCompletion(); // Ensure any underlying pool tasks complete
+
     // Verify all writes completed and data was modified
     EXPECT_EQ(completedWrites, WRITE_TASKS);
     EXPECT_EQ(sharedData.writeCount, WRITE_TASKS);
-    EXPECT_EQ(sharedData.data.size(), 5 + WRITE_TASKS);
+    EXPECT_EQ(sharedData.data.size(), 5 + WRITE_TASKS); // Initial 5 elements + WRITE_TASKS
 }
 
 TEST_F(ReaderWriterTests, MixedReadWriteOperations) {
     std::atomic<int> completedOps{0};
     static const int TASKS = 200;
+    std::vector<std::future<void>> futures;
     
     // Randomly mix read and write operations
     for (int i = 0; i < TASKS; i++) {
         if (i % 5 == 0) { // 20% writes, 80% reads
-            pool->enqueueThreadSafeWrite(sharedData, [i, &completedOps](SharedData& data) {
+            futures.emplace_back(pool->parallelWrite([i, &completedOps](SharedData& data) {
                 // Writer logic
                 ASSERT_EQ(data.writers.fetch_add(1), 0);
                 ASSERT_EQ(data.readers.load(), 0);
@@ -1177,26 +1183,28 @@ TEST_F(ReaderWriterTests, MixedReadWriteOperations) {
                 data.writeCount++;
                 data.writers--;
                 completedOps++;
-            });
+            }, std::ref(sharedData)));
         } else {
-            pool->enqueueThreadSafeRead(sharedData, [&completedOps](SharedData& data) {
+            futures.emplace_back(pool->parallelRead([&completedOps](const SharedData& data) {
                 // Reader logic
-                data.readers.fetch_add(1);
-                ASSERT_EQ(data.writers.load(), 0);
+                // Accessing sharedData directly for atomics, data parameter is for read-only access to non-atomic parts if needed
+                sharedData.readers.fetch_add(1);
+                ASSERT_EQ(sharedData.writers.load(), 0);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                data.readCount++;
-                data.readers--;
+                sharedData.readCount++;
+                sharedData.readers--;
                 completedOps++;
-            });
+            }, std::cref(sharedData)));
         }
     }
     
     // Wait for all operations to complete
-    pool->waitForCompletion();
+    for(auto& fut : futures) fut.get();
+    pool->waitForCompletion(); // Ensure any underlying pool tasks complete
     EXPECT_EQ(completedOps, TASKS);
 }
 
-// Tests for parallelRead and parallelWrite
+// Tests for parallelRead and parallelWrite (original tests for these methods)
 TEST_F(ThreadPoolTest, ParallelReadReturnsFutures) {
     std::vector<int> data{1, 2, 3, 4, 5};
     std::atomic<int> readerCount{0};
@@ -1376,31 +1384,31 @@ TEST_F(ThreadPoolTest, StressTest) {
     // Launch mixed operations
     for (int i = 0; i < OPERATIONS; i++) {
         switch (i % 5) {
-            case 0:
-                pool->enqueueThreadSafeRead(*sharedVector, [&operationsCompleted](const std::vector<int>&) {
+            case 0: // Was enqueueThreadSafeRead, now parallelRead
+                pool->parallelRead([&operationsCompleted](const std::vector<int>&) {
                     operationsCompleted++;
-                });
+                }, std::cref(*sharedVector));
                 break;
-            case 1:
-                pool->enqueueThreadSafeWrite(*sharedVector, [&operationsCompleted, i](std::vector<int>& vec) {
+            case 1: // Was enqueueThreadSafeWrite, now parallelWrite
+                pool->parallelWrite([&operationsCompleted, i](std::vector<int>& vec) {
                     vec[i % vec.size()] = i;
                     operationsCompleted++;
-                });
+                }, std::ref(*sharedVector));
                 break;
-            case 2:
+            case 2: // Already parallelRead
                 pool->parallelRead([&operationsCompleted](const std::vector<int>& vec) {
                     operationsCompleted++;
                     return vec.size();
-                }, std::ref(*sharedVector));
+                }, std::cref(*sharedVector)); // Use cref for const access
                 break;
-            case 3:
-                pool->parallelWrite([&operationsCompleted](std::vector<int>& vec, int val) {
+            case 3: // Already parallelWrite
+                pool->parallelWrite([&operationsCompleted, i](std::vector<int>& vec, int val) {
                     vec[val % vec.size()] = val;
                     operationsCompleted++;
                     return val;
                 }, std::ref(*sharedVector), i);
                 break;
-            case 4:
+            case 4: // parallelFor, remains unchanged
                 // Small parallelFor to avoid too many tasks
                 pool->parallelFor(0, 10, [&sharedVector, &operationsCompleted, i](int idx) {
                     (*sharedVector)[(i + idx) % sharedVector->size()] = idx;
@@ -1411,8 +1419,11 @@ TEST_F(ThreadPoolTest, StressTest) {
     }
     
     // Wait for completion and verify
-    pool->waitForCompletion();
-    EXPECT_GE(operationsCompleted, OPERATIONS);
+    pool->waitForCompletion(); // This waits for all enqueued tasks in the ThreadPool
+                               // For parallelRead/Write, the futures they return would also need to be .get()
+                               // if we wanted to ensure each specific lambda finished before this check.
+                               // However, waitForCompletion() should cover all pool-managed threads.
+    EXPECT_GE(operationsCompleted, OPERATIONS + (OPERATIONS/5*10) - (OPERATIONS/5) ); // parallelFor adds 10 ops and removes 1
 }
 
 TEST_F(ThreadPoolTest, ParallelForPerformanceComparison) {
@@ -1525,4 +1536,131 @@ TEST_F(ThreadPoolTest, ParallelForPerformanceComparison) {
     // Add additional methods to ThreadPool for this test
     std::cout << "\nPool final status:\n";
     pool->printStatus();
+}
+
+// --- Benchmarks ---
+
+// Trivial tasks for benchmarking
+auto trivialTask = []{};
+auto trivialRetTask = []{ return 1; };
+
+TEST_F(ThreadPoolTest, EnqueueLatencyBenchmark) {
+    const int N = 100000;
+    std::vector<long long> latencies;
+    latencies.reserve(N);
+
+    // Warm-up
+    for (int i = 0; i < N / 10; ++i) {
+        pool->enqueue(trivialTask);
+    }
+    pool->waitForCompletion();
+
+    for (int i = 0; i < N; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        pool->enqueue(trivialTask);
+        auto end = std::chrono::high_resolution_clock::now();
+        latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    }
+    pool->waitForCompletion();
+
+    long long sum = 0;
+    long long min_lat = -1, max_lat = 0;
+    if (!latencies.empty()) {
+        min_lat = latencies[0];
+        for (long long lat : latencies) {
+            sum += lat;
+            if (lat < min_lat) min_lat = lat;
+            if (lat > max_lat) max_lat = lat;
+        }
+    }
+
+    std::cout << "[BENCHMARK] EnqueueLatency: Avg=" << (latencies.empty() ? 0 : sum / latencies.size())
+              << " ns, Min=" << min_lat << " ns, Max=" << max_lat << " ns (N=" << N << ")" << std::endl;
+}
+
+TEST_F(ThreadPoolTest, RoundTripLatencyBenchmark) {
+    const int N = 10000;
+    std::vector<long long> latencies;
+    latencies.reserve(N);
+
+    // Warm-up
+    for (int i = 0; i < N / 10; ++i) {
+        pool->enqueue(trivialRetTask).get();
+    }
+    pool->waitForCompletion();
+
+    for (int i = 0; i < N; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto fut = pool->enqueue(trivialRetTask);
+        fut.get();
+        auto end = std::chrono::high_resolution_clock::now();
+        latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    }
+    pool->waitForCompletion();
+
+    long long sum = 0;
+    long long min_lat = -1, max_lat = 0;
+     if (!latencies.empty()) {
+        min_lat = latencies[0];
+        for (long long lat : latencies) {
+            sum += lat;
+            if (lat < min_lat) min_lat = lat;
+            if (lat > max_lat) max_lat = lat;
+        }
+    }
+
+    std::cout << "[BENCHMARK] RoundTripLatency: Avg=" << (latencies.empty() ? 0 : sum / latencies.size())
+              << " ns, Min=" << min_lat << " ns, Max=" << max_lat << " ns (N=" << N << ")" << std::endl;
+}
+
+TEST_F(ThreadPoolTest, ThroughputBenchmark) {
+    const int numTasks = 1000000;
+    std::atomic<int> counter{0};
+
+    // Warm-up
+    for (int i = 0; i < numTasks / 100; ++i) {
+        pool->enqueue([&counter]{ counter.fetch_add(1, std::memory_order_relaxed); });
+    }
+    pool->waitForCompletion();
+    counter.store(0); // Reset counter
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < numTasks; ++i) {
+        pool->enqueue([&counter]{ counter.fetch_add(1, std::memory_order_relaxed); });
+    }
+    pool->waitForCompletion();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    EXPECT_EQ(counter.load(), numTasks);
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    double tasks_per_second = (duration_ms > 0) ? (static_cast<double>(numTasks) / duration_ms * 1000.0) : 0;
+
+    std::cout << "[BENCHMARK] Throughput: " << tasks_per_second << " tasks/sec (N=" << numTasks
+              << ", Threads=" << pool->getThreadCount() << ", Duration=" << duration_ms << " ms)" << std::endl;
+}
+
+TEST_F(ThreadPoolTest, ParallelForBenchmark) {
+    const int numIterations = 10000000;
+    std::vector<int> data(numIterations); // Using a vector to ensure work is done
+
+    // Warm-up
+    pool->parallelFor(0, numIterations / 10, [&](int i){ data[i] = i; });
+
+    auto start = std::chrono::high_resolution_clock::now();
+    pool->parallelFor(0, numIterations, [&](int i){ data[i] = i; });
+    auto end = std::chrono::high_resolution_clock::now();
+
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    std::cout << "[BENCHMARK] ParallelFor: " << duration_ms << " ms (N=" << numIterations
+              << ", Threads=" << pool->getThreadCount() << ")" << std::endl;
+
+    // Basic check to ensure parallelFor did something
+    bool ok = true;
+    for(int i=0; i<100; ++i) { // Check a few initial values
+        if(data[i] != i) {
+            ok = false;
+            break;
+        }
+    }
+    EXPECT_TRUE(ok);
 }
