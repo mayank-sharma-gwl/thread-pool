@@ -17,7 +17,7 @@
 #include <tuple>
 #include <utility>
 #include <algorithm>
-#include "moodycamel/concurrentqueue.h"
+#include "external/moodycamel/concurrentqueue.h"
 
 #if defined(__linux__)
 #include <pthread.h>
