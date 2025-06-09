@@ -1,5 +1,5 @@
 #include "thread-pool.h"
-#include "moodycamel/concurrentqueue.h" // Required for ConcurrentQueue
+#include "external/moodycamel/concurrentqueue.h" // Required for ConcurrentQueue
 
 thread_local bool ThreadPool::isWorkerThread_ = false;
 
